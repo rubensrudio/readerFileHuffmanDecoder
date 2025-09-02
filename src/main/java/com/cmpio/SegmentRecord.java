@@ -3,231 +3,246 @@ package com.cmpio;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
-/**
- * Registro de segmento CMP:
- *   [0..263]  - Metadata (264 bytes)
- *   [264..]   - Tabela local (detecção automática):
- *               • N(uint16) + [len(uint8)]^N + [symbol(uint8|uint16)]^N
- *               • ou N(uint16) + [symbol(uint8|uint16)]^N + [len(uint8)]^N
- *   [..]      - Bitstream concatenado dos 64 blocos (MSB-first, sem padding)
- */
 public final class SegmentRecord {
 
-    /* ============================ tipos ============================ */
+    public static final int RECORD_SIZE   = 8192;
+    public static final int METADATA_SIZE = 264;  // 4+4 + (64*2) + (64*2)
+    public static final int HUFF_OFF      = 264;  // posição “esperada” de N (uint16)
+
+    public final Metadata metadata;
+    public final HuffmanTable huffman;
+    public final ByteBuffer payloadSlice; // fatia do ARQUIVO a partir do payload
+    public final int payloadStart;        // offset relativo ao INÍCIO DO RECORD
+
+    /* ================= Tipos ================= */
 
     public static final class Metadata {
-        public float minDelta, maxDelta;
-        public final int[] quantDeltas    = new int[64]; // uint16
-        public final int[] blockSizesBits = new int[64]; // uint16
-        public long totalBits() { long s=0; for (int v: blockSizesBits) s += (v & 0xFFFFL); return s; }
+        public final float minDelta;
+        public final float maxDelta;
+        public final int[] quant;      // uint16[64]
+        public final int[] blockBits;  // uint16[64]
+        public Metadata(float minDelta, float maxDelta, int[] quant, int[] blockBits) {
+            this.minDelta = minDelta; this.maxDelta = maxDelta;
+            this.quant = quant; this.blockBits = blockBits;
+        }
+        public long sumBits() { long s=0; for (int v: blockBits) s += (v & 0xFFFF); return s; }
     }
 
     public static final class HuffmanTable {
-        public int    symbolCount;     // N (1..256)
-        public byte[] codeLengths;     // N bytes
-        public int[]  symbols16;       // N valores 0..65535 (se vier 8-bit, mapeia 0..255)
-        public int    symbolWidthBytes;// 1 ou 2 (diagnóstico)
-        public int byteSize() { return 2 + symbolCount + symbolWidthBytes * symbolCount; }
-    }
-
-    public static final class Probe {
-        public final int payloadStart;    // 264 + tamTabela
-        public final long requiredBits;   // Σ blockSizes
-        public final ByteOrder metaOrder;
-        public final int symbolWidthBytes;
-        public final boolean symbolsFirst;
-        Probe(int ps, long bits, ByteOrder ord, int w, boolean sf) {
-            this.payloadStart = ps; this.requiredBits = bits; this.metaOrder = ord;
-            this.symbolWidthBytes = w; this.symbolsFirst = sf;
+        public final int   symbolCount;    // N
+        public final int[] codeLengths;    // N (0..15; 0 = símbolo ausente)
+        public final int[] symbols;        // N (0..255)
+        public final int   payloadStart;   // relativo ao início do record
+        public HuffmanTable(int n, int[] lens, int[] syms, int payloadStart) {
+            this.symbolCount = n; this.codeLengths = lens; this.symbols = syms; this.payloadStart = payloadStart;
         }
     }
 
-    /* ============================ campos ============================ */
-
-    public final Metadata     metadata;
-    public final HuffmanTable huffman;
-    public final ByteBuffer   compressedStreamSlice;
-    public final ByteOrder    metadataByteOrder;
-
-    private static final int METADATA_SIZE = 264;
-
-    private SegmentRecord(Metadata md, HuffmanTable ht, ByteBuffer payload, ByteOrder mdOrder) {
-        this.metadata = md; this.huffman = ht; this.compressedStreamSlice = payload; this.metadataByteOrder = mdOrder;
+    private SegmentRecord(Metadata md, HuffmanTable ht, ByteBuffer payloadSlice, int payloadStart) {
+        this.metadata = md; this.huffman = ht; this.payloadSlice = payloadSlice; this.payloadStart = payloadStart;
     }
 
-    /* ============================ API ============================ */
+    /* =============== API PRINCIPAL =============== */
 
-    public static SegmentRecord parse(ByteBuffer record, ByteOrder fileOrder) {
-        // tenta nas duas ordens de endianness para o cabeçalho local (metadata+tabela)
-        ByteOrder alt = (fileOrder == ByteOrder.BIG_ENDIAN) ? ByteOrder.LITTLE_ENDIAN : ByteOrder.BIG_ENDIAN;
+    public static SegmentRecord parse(ByteBuffer fileBuf, int recStart, ByteOrder order) {
+        ByteBuffer rec = slice(fileBuf, recStart, RECORD_SIZE).order(order);
 
-        ParseAttempt a = tryParseFlexible(record, fileOrder);
-        if (a.valid) return a.build();
+        // 1) METADATA (0..263)
+        float minDelta = rec.getFloat(0);
+        float maxDelta = rec.getFloat(4);
 
-        ParseAttempt b = tryParseFlexible(record, alt);
-        if (b.valid) return b.build();
+        int[] quant = new int[64];
+        for (int i=0, off=8; i<64; i++, off+=2) quant[i] = rec.getShort(off) & 0xFFFF;
 
-        throw new IllegalStateException("Segment metadata/table inconsistent with provided record buffer.");
-    }
+        int[] blockBits = new int[64];
+        for (int i=0, off=136; i<64; i++, off+=2) blockBits[i] = rec.getShort(off) & 0xFFFF;
 
-    /** Probe para REC_len==0 (registro variável). Lê só cabeçalho+ tabela e calcula payloadStart/Σbits. */
-    public static Probe probe(ByteBuffer atLeast8192, ByteOrder fileOrder) {
-        ByteOrder alt = (fileOrder == ByteOrder.BIG_ENDIAN) ? ByteOrder.LITTLE_ENDIAN : ByteOrder.BIG_ENDIAN;
+        Metadata md = new Metadata(minDelta, maxDelta, quant, blockBits);
+        long requiredBits = md.sumBits();
 
-        Probe p = tryProbeFlexible(atLeast8192, fileOrder);
-        if (p != null) return p;
-
-        Probe q = tryProbeFlexible(atLeast8192, alt);
-        if (q != null) return q;
-
-        throw new IllegalStateException("Cannot probe segment: metadata/Huffman header unreadable.");
-    }
-
-    /* ============================ helpers ============================ */
-
-    private static Metadata readMetadata(ByteBuffer rec, ByteOrder ord) {
-        ByteBuffer b = rec.duplicate().order(ord);
-        b.position(0);
-
-        Metadata md = new Metadata();
-        md.minDelta = b.getFloat();
-        md.maxDelta = b.getFloat();
-        for (int i = 0; i < 64; i++) md.quantDeltas[i]    = Short.toUnsignedInt(b.getShort());
-        for (int i = 0; i < 64; i++) md.blockSizesBits[i] = Short.toUnsignedInt(b.getShort());
-        return md;
-    }
-
-    private static final class ParseAttempt {
-        final Metadata md; final HuffmanTable ht; final ByteBuffer payload; final ByteOrder mdOrder; final boolean valid;
-        ParseAttempt(Metadata md, HuffmanTable ht, ByteBuffer payload, ByteOrder mdOrder, boolean valid) {
-            this.md = md; this.ht = ht; this.payload = payload; this.mdOrder = mdOrder; this.valid = valid;
+        // 2) HUFFMAN (robusto: tenta offsets perto de 264 e, se precisar, varre mais amplo)
+        Candidate best = findHuffman(rec, fileBuf, recStart);
+        if (best == null) {
+            throw new IllegalStateException("Huffman table não reconhecida: nenhum vetor cabe como comprimentos 0..15 + Kraft.");
         }
-        SegmentRecord build() { return new SegmentRecord(md, ht, payload, mdOrder); }
+
+        ByteBuffer payload = slice(fileBuf, recStart + best.payloadOff, RECORD_SIZE - best.payloadOff)
+                .order(ByteOrder.BIG_ENDIAN);
+
+        HuffmanTable ht = new HuffmanTable(best.N, best.lens, best.syms, best.payloadOff);
+
+        // Diag amigável
+        int availableBits = payload.remaining() * 8;
+        System.out.printf(
+                "Segment parsed: minDelta=%.6f maxDelta=%.6f, N=%d, base=%d (shift %+d, N-%s), layout=%s, lensEnc=%s, payloadStart=%d, requiredBits=%d, availableBits=%d%n",
+                minDelta, maxDelta, best.N, best.base, best.base - HUFF_OFF,
+                best.nEndian == ByteOrder.BIG_ENDIAN ? "BE" : "LE",
+                best.layout, best.lensEnc.desc, best.payloadOff, requiredBits, availableBits);
+
+        return new SegmentRecord(md, ht, payload, best.payloadOff);
     }
 
-    /** Lê tabela em qualquer uma das 4 combinações: [len|sym] × [sym8|sym16]; valida e escolhe a que fecha. */
-    private static ParseAttempt tryParseFlexible(ByteBuffer rec, ByteOrder ord) {
-        try {
-            Metadata md = readMetadata(rec, ord);
-            long requiredBits = md.totalBits();
+    /* =============== Localizador robusto da tabela =============== */
 
-            // Tenta combinações em ordem mais comum: [symbols16][lengths], [lengths][symbols16], [symbols8][lengths], [lengths][symbols8]
-            boolean[] symbolsFirstOpts = { true, false };
-            int[]     symWidthOpts     = { 2, 1 };
+    private enum Layout { LEN_SYM, SYM_LEN }
+    private enum LenEnc {
+        BYTES("bytes"),
+        NIBBLES_HI_LO("nibbles(hi->lo)"),
+        NIBBLES_LO_HI("nibbles(lo->hi)");
+        final String desc; LenEnc(String d){this.desc=d;}
+    }
 
-            for (boolean symbolsFirst : symbolsFirstOpts) {
-                for (int symW : symWidthOpts) {
-                    HuffmanTable ht = readHuffmanFlexible(rec, METADATA_SIZE, ord, symbolsFirst, symW);
-                    if (ht == null) continue;
+    private static final class Candidate {
+        final int base; final ByteOrder nEndian; final int N;
+        final int[] lens; final int[] syms;
+        final int payloadOff; final Layout layout; final LenEnc lensEnc;
+        final int score;
+        Candidate(int base, ByteOrder nEndian, int N, int[] lens, int[] syms,
+                  int payloadOff, Layout layout, LenEnc enc, int score) {
+            this.base=base; this.nEndian=nEndian; this.N=N; this.lens=lens; this.syms=syms;
+            this.payloadOff=payloadOff; this.layout=layout; this.lensEnc=enc; this.score=score;
+        }
+    }
 
-                    int payloadStart = METADATA_SIZE + ht.byteSize();
-                    if (payloadStart > rec.limit()) continue;
+    private static Candidate findHuffman(ByteBuffer rec, ByteBuffer fileBuf, int recStart) {
+        // Fase 1: região próxima do esperado
+        Candidate c = tryRange(rec, fileBuf, recStart, HUFF_OFF-4, HUFF_OFF+4);
+        if (c != null) return c;
+        // Fase 2: varredura conservadora pelo record
+        return tryRange(rec, fileBuf, recStart, 240, 4096);
+    }
 
-                    // comprimentos têm que ser plausíveis (<=32 e existir pelo menos um >0)
-                    int maxLen = 0, nz = 0;
-                    for (byte Lb : ht.codeLengths) {
-                        int L = Lb & 0xFF;
-                        if (L > maxLen) maxLen = L;
-                        if (L > 0) nz++;
+    private static Candidate tryRange(ByteBuffer rec, ByteBuffer fileBuf, int recStart, int from, int to) {
+        Candidate best = null;
+
+        for (int base = Math.max(0, from); base <= Math.min(RECORD_SIZE-2, to); base++) {
+            for (ByteOrder nbo : new ByteOrder[]{ByteOrder.BIG_ENDIAN, ByteOrder.LITTLE_ENDIAN}) {
+                int N = readU16(rec, base, nbo);
+                if (N < 1 || N > 256) continue;
+
+                // Tentar quatro layouts: LEN+SYM e SYM+LEN, com lens em BYTES/NIBBLES (e 2 ordens de nibbles)
+                for (Layout lay : new Layout[]{Layout.LEN_SYM, Layout.SYM_LEN}) {
+                    for (LenEnc enc : new LenEnc[]{LenEnc.BYTES, LenEnc.NIBBLES_HI_LO, LenEnc.NIBBLES_LO_HI}) {
+                        Candidate cand = tryLayout(rec, fileBuf, recStart, base, N, lay, enc);
+                        if (cand == null) continue;
+                        // escolhe melhor por: prefixHit, proximidade de 264, número de comprimentos !=0
+                        if (best == null || cand.score > best.score) best = cand;
                     }
-                    if (nz == 0 || maxLen > 32) continue;
-
-                    long availableBits = (long) (rec.limit() - payloadStart) * 8L;
-                    if (requiredBits > availableBits) continue;
-
-                    ByteBuffer payload = rec.duplicate();
-                    payload.position(payloadStart);
-                    payload = payload.slice();
-
-                    return new ParseAttempt(md, ht, payload, ord, true);
                 }
             }
-            return new ParseAttempt(null, null, null, ord, false);
-        } catch (Throwable t) {
-            return new ParseAttempt(null, null, null, ord, false);
         }
+        return best;
     }
 
-    private static HuffmanTable readHuffmanFlexible(ByteBuffer rec, int base, ByteOrder ord,
-                                                    boolean symbolsFirst, int symbolWidthBytes) {
-        try {
-            ByteBuffer b = rec.duplicate().order(ord);
-            b.position(base);
+    /** Testa um layout específico a partir de 'base' (onde está o N). */
+    private static Candidate tryLayout(ByteBuffer rec, ByteBuffer fileBuf, int recStart,
+                                       int base, int N, Layout layout, LenEnc enc) {
 
-            int N = Short.toUnsignedInt(b.getShort());
-            if (N < 1 || N > 256) return null;
+        // Tamanhos dos vetores conforme “enc”
+        int lenBytes = (enc == LenEnc.BYTES) ? N : ((N + 1) >> 1); // ceil(N/2)
+        int symBytes = N;
 
-            int lenPos, symPos, after;
-            if (symbolsFirst) {
-                symPos = base + 2;
-                lenPos = symPos + symbolWidthBytes * N;
-            } else {
-                lenPos = base + 2;
-                symPos = lenPos + N;
-            }
-            after = symPos + symbolWidthBytes * N;
+        // Offsets dos dois vetores
+        int v1Off = base + 2;
+        int v2Off = v1Off + (layout == Layout.LEN_SYM ? lenBytes : symBytes);
+        int payloadOff = v2Off + (layout == Layout.LEN_SYM ? symBytes : lenBytes);
 
-            if (after > rec.limit()) return null;
+        if (payloadOff > RECORD_SIZE) return null;
 
-            // Lê comprimentos (sempre N bytes)
-            ByteBuffer bl = rec.duplicate().order(ord);
-            bl.position(lenPos);
-            byte[] lengths = new byte[N];
-            bl.get(lengths);
+        // Extrai lens e syms conforme o layout/codificação
+        int[] lens, syms;
 
-            // Lê símbolos (8 ou 16 bits)
-            int[] sym16 = new int[N];
-            ByteBuffer bs = rec.duplicate().order(ord);
-            bs.position(symPos);
-            if (symbolWidthBytes == 1) {
-                for (int i = 0; i < N; i++) sym16[i] = Byte.toUnsignedInt(bs.get());
-            } else if (symbolWidthBytes == 2) {
-                for (int i = 0; i < N; i++) sym16[i] = Short.toUnsignedInt(bs.getShort());
-            } else return null;
-
-            HuffmanTable ht = new HuffmanTable();
-            ht.symbolCount = N;
-            ht.codeLengths = lengths;
-            ht.symbols16   = sym16;
-            ht.symbolWidthBytes = symbolWidthBytes;
-            return ht;
-        } catch (Throwable t) {
-            return null;
+        if (layout == Layout.LEN_SYM) {
+            lens = readLens(rec, v1Off, N, enc);
+            if (lens == null) return null;
+            syms = readU8(rec, v2Off, N);
+        } else { // SYM_LEN
+            syms = readU8(rec, v1Off, N);
+            lens = readLens(rec, v2Off, N, enc);
+            if (lens == null) return null;
         }
+
+        // Validações:
+        if (!looksLen(lens)) return null;
+        for (int s : syms) if (s < 0 || s > 255) return null;
+        if (!CmpSanity.kraftOk(lens)) return null;
+
+        // Desempate por prefix probe
+        boolean prefixHit = false;
+        {
+            ByteBuffer tentative = slice(fileBuf, recStart + payloadOff, RECORD_SIZE - payloadOff);
+            prefixHit = CmpSanity.prefixLooksLike(tentative, lens, 64);
+        }
+
+        int dist = Math.abs(base - HUFF_OFF);
+        int nz = countNonZero(lens);
+        int score = (prefixHit ? 100000 : 0) - dist + nz;
+
+        return new Candidate(base, ByteOrder.BIG_ENDIAN /*N já incorporado no base, score não precisa de endianness*/,
+                N, lens, syms, payloadOff, layout, enc, score);
     }
 
-    /** Probe que tenta detectar ordem e largura e retorna o payloadStart correto. */
-    private static Probe tryProbeFlexible(ByteBuffer rec, ByteOrder ord) {
-        try {
-            Metadata md = readMetadata(rec, ord);
-            long requiredBits = md.totalBits();
+    /* ================= Helpers ================= */
 
-            boolean[] symbolsFirstOpts = { true, false };
-            int[]     symWidthOpts     = { 2, 1 };
+    private static int countNonZero(int[] v){int c=0; for(int x: v) if(x!=0)c++; return c;}
 
-            for (boolean symbolsFirst : symbolsFirstOpts) {
-                for (int symW : symWidthOpts) {
-                    HuffmanTable ht = readHuffmanFlexible(rec, METADATA_SIZE, ord, symbolsFirst, symW);
-                    if (ht == null) continue;
+    /** Vetor “crível” de comprimentos: 0..15, ≥1 não-zero. Kraft é checada separadamente. */
+    private static boolean looksLen(int[] v) {
+        if (v == null || v.length == 0) return false;
+        int nz = 0;
+        for (int x : v) { if (x < 0 || x > 15) return false; if (x != 0) nz++; }
+        return nz > 0;
+    }
 
-                    // comprimentos plausíveis?
-                    int maxLen = 0, nz = 0;
-                    for (byte Lb : ht.codeLengths) {
-                        int L = Lb & 0xFF;
-                        if (L > maxLen) maxLen = L;
-                        if (L > 0) nz++;
-                    }
-                    if (nz == 0 || maxLen > 32) continue;
+    private static int readU16(ByteBuffer buf, int off, ByteOrder bo) {
+        int b0 = buf.get(off)   & 0xFF;
+        int b1 = buf.get(off+1) & 0xFF;
+        return (bo == ByteOrder.BIG_ENDIAN) ? ((b0 << 8)|b1) : ((b1 << 8)|b0);
+    }
 
-                    int payloadStart = METADATA_SIZE + ht.byteSize();
-                    if (payloadStart > rec.limit()) continue; // precisa caber no buffer do probe (>=8192)
+    private static int[] readU8(ByteBuffer buf, int off, int n) {
+        int[] out = new int[n];
+        for (int i=0;i<n;i++) out[i] = buf.get(off+i) & 0xFF;
+        return out;
+    }
 
-                    return new Probe(payloadStart, requiredBits, ord, symW, symbolsFirst);
-                }
-            }
-            return null;
-        } catch (Throwable t) {
-            return null;
+    /** Lê comprimentos com base em enc (bytes ou nibbles). */
+    private static int[] readLens(ByteBuffer buf, int off, int N, LenEnc enc) {
+        int[] lens = new int[N];
+        if (enc == LenEnc.BYTES) {
+            for (int i=0;i<N;i++) lens[i] = buf.get(off+i) & 0xFF;
+            return lens;
         }
+
+        // NIBBLES
+        int needBytes = (N + 1) >> 1;
+        int idx = 0;
+        for (int b=0; b<needBytes; b++) {
+            int v = buf.get(off + b) & 0xFF;
+            int hi = (v >>> 4) & 0xF;
+            int lo = v & 0xF;
+
+            if (enc == LenEnc.NIBBLES_HI_LO) {
+                if (idx < N) lens[idx++] = hi;
+                if (idx < N) lens[idx++] = lo;
+            } else { // NIBBLES_LO_HI
+                if (idx < N) lens[idx++] = lo;
+                if (idx < N) lens[idx++] = hi;
+            }
+        }
+        return lens;
+    }
+
+    private static ByteBuffer slice(ByteBuffer src, int pos, int len) {
+        ByteBuffer d = src.duplicate();
+        d.position(pos); d.limit(pos + len);
+        return d.slice();
+    }
+
+    /** Utilitário: hexdump local (debug). */
+    public static String dumpAround(ByteBuffer fileBuf, int recStart, int center, int span) {
+        int from = Math.max(0, center - span), to = Math.min(RECORD_SIZE, center + span);
+        ByteBuffer rec = slice(fileBuf, recStart + from, to - from);
+        return CmpSanity.hexdump(rec, 0, rec.remaining());
     }
 }
