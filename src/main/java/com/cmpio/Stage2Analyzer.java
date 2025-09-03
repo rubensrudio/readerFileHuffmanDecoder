@@ -1,271 +1,239 @@
 package com.cmpio;
 
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.Arrays;
 
 /**
- * Analisa um SegmentRecord:
- *  - valida a tabela de Huffman (Kraft)
- *  - checa capacidade (requiredBits x availableBits)
- *  - faz um "preview" de decodificação tolerante a erros (MSB/LSB, invert, startShift 0..7)
- *
- * Importante: se o bitstream ultrapassar 1 record (8192 B), esta classe
- * apenas avisa e NÃO tenta juntar múltiplos records (isso deve ser feito
- * em um nível acima do reader).
+ * Stage 2 – valida a tabela local, monta o bitstream multi-record e faz um preview de decodificação.
+ * Configurado para usar LSB, invert=false, shift=0 (modo validado no seu arquivo).
  */
 public final class Stage2Analyzer {
 
-    /** Quantos símbolos no preview de decodificação (diagnóstico). */
-    private static final int PREVIEW_TOKENS = 32;
-
-    /** Ponto de entrada único. */
-    public void analyze(SegmentRecord rec) {
-        // Dump resumido do segmento + tabela (seguro contra nulos)
-        CmpSanity.dumpSegmentSummary(rec, null);
-
-        if (rec == null || rec.huffman == null || rec.metadata == null) {
-            System.out.println("Registro/tabela/metadata ausentes — encerrando análise.");
-            return;
-        }
-
-        final int[] lens = rec.huffman.codeLengths;
-        final int[] syms = rec.huffman.symbols;
-
-        // Validações essenciais de Huffman
-        if (lens == null || syms == null || lens.length != syms.length || lens.length == 0) {
-            throw new IllegalStateException("Huffman table inválida (tamanhos inconsistentes).");
-        }
-        if (!CmpSanity.kraftOk(lens)) {
-            throw new IllegalStateException("Huffman lengths falham a desigualdade de Kraft.");
-        }
-        // Símbolos precisam estar no intervalo de byte; duplicatas são tecnicamente permitidas
-        // (vários códigos mapeando ao mesmo símbolo), então não exigimos unicidade aqui.
-        for (int s : syms) {
-            if (s < 0 || s > 255) {
-                throw new IllegalStateException("Símbolo fora do intervalo 0..255: " + s);
-            }
-        }
-
-        // Capacidade do payload deste record
-        final long requiredBits  = rec.metadata.sumBits(); // <-- atualizado
-        final int  availableBits = (rec.payloadSlice != null ? rec.payloadSlice.remaining() * 8 : 0);
-
-        if (requiredBits > availableBits) {
-            System.out.printf(
-                    "Aviso: requiredBits=%d > availableBits=%d (%+.0f bytes). " +
-                            "Provável bitstream multi-record — juntar bytes dos próximos records antes de decodificar.%n",
-                    requiredBits, availableBits, Math.ceil((requiredBits - availableBits) / 8.0));
-            // Mesmo assim, tentamos um preview curto só para alinhar modo de bits:
-            previewDecode(rec);
-            return;
-        }
-
-        // Preview normal (quando cabe no record)
-        previewDecode(rec);
-    }
-
-    /* =======================================================================================
-     * Preview de decodificação tolerante a erros
-     * ======================================================================================= */
-    private void previewDecode(SegmentRecord rec) {
-        if (rec.payloadSlice == null || rec.payloadSlice.remaining() == 0) {
-            System.out.println(">> Preview: payload vazio.");
-            return;
-        }
-        final byte[] payload = toBytes(rec.payloadSlice);
-        final CanonicalDecoder dec = new CanonicalDecoder(rec.huffman.codeLengths, rec.huffman.symbols);
-
-        // Tentamos modos (ordem, invert, startShift) e aceitamos o primeiro que
-        // conseguir decodificar um número mínimo de tokens sem erro.
-        Mode best = null;
-        int bestOk = -1;
-        int[] bestSample = null;
-
-        for (BitOrder ord : BitOrder.values()) {
-            for (boolean invert : new boolean[]{false, true}) {
-                for (int shift = 0; shift < 8; shift++) {
-                    BitReader br = new BitReader(payload, shift, ord, invert);
-                    int[] out = new int[PREVIEW_TOKENS];
-                    int ok = 0;
-                    for (int i = 0; i < PREVIEW_TOKENS; i++) {
-                        int sym = dec.tryDecode(br);
-                        if (sym < 0) break; // falhou neste modo
-                        out[ok++] = sym;
-                    }
-                    if (ok > bestOk) {
-                        bestOk = ok;
-                        best = new Mode(ord, invert, shift);
-                        bestSample = Arrays.copyOf(out, ok);
-                    }
-                    if (bestOk >= PREVIEW_TOKENS) break;
-                }
-                if (bestOk >= PREVIEW_TOKENS) break;
-            }
-            if (bestOk >= PREVIEW_TOKENS) break;
-        }
-
-        if (bestOk <= 0 || best == null) {
-            System.out.println(">> Preview: não foi possível decodificar de forma consistente " +
-                    "em nenhum modo (MSB/LSB, invert, shifts 0..7).");
-            return;
-        }
-
-        System.out.printf(">> Preview OK: %d símbolos decodificados com %s (invert=%s, shift=%d)%n",
-                bestOk, best.order, best.invert, best.shift);
-        System.out.print("   amostra: ");
-        for (int i = 0; i < Math.min(bestOk, 24); i++) {
-            if (i > 0) System.out.print(", ");
-            System.out.print(bestSample[i]);
-        }
-        if (bestOk > 24) System.out.print(", ...");
-        System.out.println();
-    }
-
-    /* =======================================================================================
-     * Infra: decodificador canônico e leitor de bits
-     * ======================================================================================= */
-
-    /** MSB-first ou LSB-first. */
-    private enum BitOrder { MSB, LSB }
-
-    /** Parametrização vencedora do preview. */
-    private static final class Mode {
-        final BitOrder order; final boolean invert; final int shift;
-        Mode(BitOrder order, boolean invert, int shift) {
-            this.order = order; this.invert = invert; this.shift = shift;
-        }
-    }
-
-    /** Leitor de bits a partir de um array de bytes, com suporte a MSB/LSB, invert e shift inicial. */
-    private static final class BitReader {
-        final byte[] data;
-        final BitOrder order;
-        final boolean invert;
-        long bitPos; // posição corrente em bits, a partir de 0
-
-        BitReader(byte[] data, int startShift, BitOrder order, boolean invert) {
-            this.data = data;
-            this.order = order;
-            this.invert = invert;
-            this.bitPos = startShift; // permite deslocar o alinhamento inicial 0..7
-        }
-
-        /** Lê próximo bit (0/1) avançando 1. Retorna -1 se acabou. */
-        int readBit() {
-            if (bitPos >= (long) data.length * 8L) return -1;
-            int bit;
-            int idx = (int) (bitPos >>> 3);
-            int ofs = (int) (bitPos & 7);
-            int b = data[idx] & 0xFF;
-
-            if (order == BitOrder.MSB) {
-                bit = (b >>> (7 - ofs)) & 1;
-            } else {
-                bit = (b >>> ofs) & 1;
-            }
-            bitPos++;
-            if (invert) bit ^= 1;
-            return bit;
-        }
-
-        /** Lê n bits (n<=24), MSB-first no inteiro retornado, avançando n. Retorna -1 se não há bits. */
-        int readBits(int n) {
-            int v = 0;
-            for (int i = 0; i < n; i++) {
-                int bit = readBit();
-                if (bit < 0) return -1;
-                v = (v << 1) | bit;
-            }
-            return v;
-        }
-
-        /** Espia n bits (n<=24) sem consumir; -1 se não há bits. */
-        int peekBits(int n) {
-            long save = bitPos;
-            int v = readBits(n);
-            bitPos = save;
-            return v;
-        }
-    }
+    private Stage2Analyzer() {}
 
     /**
-     * Decodificador Huffman canônico para símbolos em 0..255.
-     * Constrói vetores first/last e um vetor de símbolos "ordenado por comprimento".
+     * Analisa o segmento já parseado, faz a montagem multi-record e tenta decodificar alguns símbolos.
+     *
+     * @param fileBuf      buffer do arquivo inteiro
+     * @param recStart     offset no arquivo do record que contém o segmento selecionado
+     * @param order        ordem de bytes para leitura do METADATA (BIG_ENDIAN no seu caso)
+     * @param rec          SegmentRecord resultante de SegmentRecord.parse(fileBuf, recStart, order)
      */
-    private static final class CanonicalDecoder {
-        final int maxL;
-        final int[] firstCode;    // firstCode[L]
-        final int[] lastCode;     // lastCode[L]
-        final int[] firstIndex;   // índice inicial em sortedSymbols para comprimento L
-        final int[] sortedSymbols;
+    public static void analyze(ByteBuffer fileBuf, int recStart, ByteOrder order, SegmentRecord rec) {
+        // 1) Info de metadata e huffman
+        final long requiredBits = rec.metadata.sumBits();
+        final int  availableBits = rec.payloadSlice.remaining() * 8;
 
-        CanonicalDecoder(int[] codeLengths, int[] symbols) {
-            if (codeLengths.length != symbols.length)
-                throw new IllegalArgumentException("lens.length != symbols.length");
+        System.out.printf("Metadata: minDelta=%.6f  maxDelta=%.6f  totalBits=%d  (payloadBytes=%d)%n",
+                rec.metadata.minDelta, rec.metadata.maxDelta, requiredBits,
+                rec.payloadSlice.remaining());
 
-            // Contagem por comprimento
-            int[] count = new int[33];
-            int m = 0;
-            for (int L : codeLengths) {
-                if (L < 0 || L > 32) throw new IllegalArgumentException("Invalid length " + L);
-                if (L > 0) { count[L]++; if (L > m) m = L; }
-            }
-            this.maxL = m;
+        final int N = rec.huffman.symbolCount;
+        final int maxLen = max(rec.huffman.codeLengths);
+        final int nonZero = countNonZero(rec.huffman.codeLengths);
+        System.out.printf("Huffman N=%d, maxlen=%d, nonZeroLens=%d, kraftOk=%s%n",
+                N, maxLen, nonZero, CmpSanity.kraftOk(rec.huffman.codeLengths));
 
-            // firstCode/firstIndex por comprimento
-            this.firstCode  = new int[33];
-            this.lastCode   = new int[33];
-            this.firstIndex = new int[33];
+        int[] hist = lengthsHistogram(rec.huffman.codeLengths);
+        System.out.printf("Lengths histogram: %s%n", histogramToString(hist));
 
-            int code = 0, index = 0;
-            for (int L = 1; L <= maxL; L++) {
-                code = (code + count[L - 1]) << 1;
-                firstCode[L]  = code;
-                firstIndex[L] = index;
-                lastCode[L]   = code + count[L] - 1;
-                index += count[L];
-            }
+        System.out.printf("requiredBits=%d, availableBits=%d, payloadStartByte=%d%n",
+                requiredBits, availableBits, rec.huffman.payloadStart);
 
-            // Monta vetor de símbolos ordenado por comprimento (estável pelo índice original)
-            this.sortedSymbols = new int[codeLengths.length];
-            int[] cursor = Arrays.copyOf(firstIndex, firstIndex.length);
-            for (int L = 1; L <= maxL; L++) {
-                for (int i = 0; i < codeLengths.length; i++) {
-                    if (codeLengths[i] == L) {
-                        int pos = cursor[L]++;
-                        sortedSymbols[pos] = symbols[i] & 0xFF;
-                    }
-                }
-            }
+        // 2) Monta bitstream multi-record se necessário
+        PayloadAssembler.Assembled asm = PayloadAssembler.assemble(
+                fileBuf, recStart, order, rec, requiredBits);
+
+        int asmBits = asm.bytes.length * 8;
+        if (asmBits < requiredBits) {
+            System.out.printf("Aviso: ainda faltam %d bits após assemble (bytes=%d).%n",
+                    (requiredBits - asmBits), asm.bytes.length);
+        } else if (availableBits < requiredBits) {
+            System.out.printf("Aviso: requiredBits=%d > availableBits=%d (+%d bytes). Bitstream multi-record montado (%d bytes).%n",
+                    requiredBits, availableBits, ((requiredBits - availableBits) + 7) >>> 3, asm.bytes.length);
         }
 
-        /** Tenta decodificar um símbolo; retorna -1 se não bater com nenhum prefixo válido. */
-        int tryDecode(BitReader br) {
-            int acc = 0;
-            for (int L = 1; L <= maxL; L++) {
-                int bit = br.readBit();
-                if (bit < 0) return -1;
-                acc = (acc << 1) | bit;
-
-                int lo = firstCode[L], hi = lastCode[L];
-                if (hi >= lo && acc >= lo && acc <= hi) {
-                    int off = acc - lo;
-                    int idx = firstIndex[L] + off;
-                    if (idx < 0 || idx >= sortedSymbols.length) return -1;
-                    return sortedSymbols[idx];
+        // 3) Preview de decodificação
+        //    Modo já confirmado anteriormente: LSB, invert=false, shift=0
+        try {
+            PreviewResult pr = previewDecodeLSB(asm.bytes, (int)requiredBits, rec.huffman, 16);
+            if (pr.ok) {
+                System.out.printf(">> Preview OK: %d símbolos decodificados com LSB (invert=false, shift=0)%n", pr.decoded);
+                System.out.print("   amostra: ");
+                for (int i = 0; i < pr.decoded; i++) {
+                    System.out.print(pr.sample[i]);
+                    if (i + 1 < pr.decoded) System.out.print(", ");
                 }
+                System.out.println();
+            } else {
+                System.out.println(">> Preview falhou mesmo em LSB/invert=false/shift=0 (isso não era esperado).");
             }
-            return -1;
+        } catch (Exception ex) {
+            System.out.println(">> Preview exception: " + ex.getMessage());
         }
     }
 
-    /* =======================================================================================
-     * Utilitários locais
-     * ======================================================================================= */
-    private static byte[] toBytes(ByteBuffer buf) {
-        ByteBuffer b = buf.duplicate();
-        byte[] out = new byte[b.remaining()];
-        b.get(out);
-        return out;
+    /* ===================== PREVIEW – Huffman LSB ===================== */
+
+    private static final class Node {
+        int sym = -1;
+        Node z; // bit 0
+        Node o; // bit 1
+    }
+
+    private static final class PreviewResult {
+        boolean ok;
+        int decoded;
+        int[] sample;
+    }
+
+    private static PreviewResult previewDecodeLSB(byte[] bytes, int maxBits, SegmentRecord.HuffmanTable ht, int wantSymbols) {
+        // 1) Constrói códigos canônicos
+        CanonicalCodes codes = buildCanonicalCodes(ht.codeLengths, ht.symbols);
+
+        // 2) Para LSB-first, precisamos inserir os códigos REVERSOS na trie (e depois ler bits na ordem LSB)
+        Node root = new Node();
+        for (int i = 0; i < codes.count; i++) {
+            int L = codes.lengths[i];
+            if (L == 0) continue;
+            int code = codes.codes[i];
+            int rev = reverseBits(code, L);
+            int sym = codes.symbols[i];
+            Node n = root;
+            for (int b = L - 1; b >= 0; b--) {
+                int bit = (rev >>> b) & 1; // caminhar MSB->LSB do código já reverso
+                n = (bit == 0) ? (n.z == null ? (n.z = new Node()) : n.z)
+                        : (n.o == null ? (n.o = new Node()) : n.o);
+            }
+            n.sym = sym;
+        }
+
+        // 3) Lê bits LSB-first (sem inversão, shift=0) e caminha na trie
+        BitReaderLSB r = new BitReaderLSB(bytes);
+        PreviewResult pr = new PreviewResult();
+        pr.sample = new int[Math.min(wantSymbols, 64)];
+        int produced = 0;
+        while (produced < pr.sample.length && r.bitPos < maxBits) {
+            Node n = root;
+            while (n.sym < 0) {
+                int bit = r.readBit();
+                if (bit < 0) { pr.ok = false; pr.decoded = produced; return pr; }
+                n = (bit == 0) ? n.z : n.o;
+                if (n == null) { pr.ok = false; pr.decoded = produced; return pr; }
+            }
+            pr.sample[produced++] = n.sym;
+        }
+        pr.ok = produced > 0;
+        pr.decoded = produced;
+        return pr;
+    }
+
+    private static final class BitReaderLSB {
+        final byte[] a;
+        int bitPos = 0; // posição em bits desde o início do array
+        BitReaderLSB(byte[] a) { this.a = a; }
+        int readBit() {
+            int byteIndex = bitPos >>> 3;
+            if (byteIndex >= a.length) return -1;
+            int bitIndex = bitPos & 7;      // 0..7
+            int v = a[byteIndex] & 0xFF;
+            int bit = (v >>> bitIndex) & 1; // LSB-first
+            bitPos++;
+            return bit;
+        }
+    }
+
+    private static final class CanonicalCodes {
+        final int count;
+        final int[] codes;    // código canônico (MSB) por i
+        final int[] lengths;  // comprimento por i
+        final int[] symbols;  // símbolo por i
+        CanonicalCodes(int c, int[] codes, int[] lengths, int[] symbols){
+            this.count=c; this.codes=codes; this.lengths=lengths; this.symbols=symbols;
+        }
+    }
+
+    /** Constrói códigos canônicos padrão (ordem: por L crescente, e dentro do mesmo L por ordem de 'symbols'). */
+    private static CanonicalCodes buildCanonicalCodes(int[] lens, int[] syms) {
+        int n = lens.length;
+        // Ordena (L, símbolo) mas preserva o mapeamento
+        int[][] pairs = new int[n][3]; // [L, sym, idx]
+        int count = 0;
+        for (int i=0;i<n;i++) {
+            int L = lens[i];
+            if (L == 0) continue;
+            pairs[count][0] = L;
+            pairs[count][1] = syms[i] & 0xFF;
+            pairs[count][2] = i;
+            count++;
+        }
+        Arrays.sort(pairs, 0, count, (a,b) -> {
+            int d = Integer.compare(a[0], b[0]);
+            return (d != 0) ? d : Integer.compare(a[1], b[1]);
+        });
+
+        int[] codes   = new int[count];
+        int[] lengths = new int[count];
+        int[] symbols = new int[count];
+
+        int code = 0;
+        int prevLen = (count > 0 ? pairs[0][0] : 0);
+
+        for (int i=0;i<count;i++) {
+            int L = pairs[i][0];
+            int sym = pairs[i][1];
+
+            if (i == 0) {
+                code = 0;
+                prevLen = L;
+            } else {
+                if (L == prevLen) {
+                    code += 1;
+                } else {
+                    code = (code + 1) << (L - prevLen);
+                    prevLen = L;
+                }
+            }
+
+            codes[i]   = code;
+            lengths[i] = L;
+            symbols[i] = sym;
+        }
+
+        return new CanonicalCodes(count, codes, lengths, symbols);
+    }
+
+    private static int reverseBits(int v, int len) {
+        int r = 0;
+        for (int i=0;i<len;i++) {
+            r = (r << 1) | (v & 1);
+            v >>>= 1;
+        }
+        return r;
+    }
+
+    /* ===================== Utils ===================== */
+
+    private static int max(int[] a){ int m=0; for(int x: a) if(x>m) m=x; return m; }
+    private static int countNonZero(int[] a){ int c=0; for(int x: a) if(x!=0) c++; return c; }
+
+    private static int[] lengthsHistogram(int[] lens) {
+        int max = 0;
+        for (int L : lens) if (L > max) max = L;
+        int[] h = new int[Math.max(16, max+1)];
+        for (int L : lens) h[L]++;
+        return h;
+    }
+
+    private static String histogramToString(int[] h) {
+        StringBuilder sb = new StringBuilder();
+        for (int L=0; L<h.length; L++) {
+            if (h[L] != 0) {
+                if (sb.length() != 0) sb.append(' ');
+                sb.append(L).append(':').append(h[L]);
+            }
+        }
+        return sb.length()==0 ? "(vazio)" : sb.toString();
     }
 }

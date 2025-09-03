@@ -6,6 +6,7 @@ import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 
 /**
@@ -14,15 +15,22 @@ import java.nio.file.StandardOpenOption;
  * - Lê File Header e Data Header de acordo com offsets indicados.
  * - Suporta tabela de offsets iniciando em OT_pos ou OT_pos+8 (lead-in opcional).
  * - Fornece utilidades para localizar e ler Segment Records (8192 bytes).
+ *
+ * API compatível com AnalyzeSegment/MainDemo/Stage2Analyzer:
+ *   - CmpReader.open(String)
+ *   - getOrder(), getFileBuffer()
+ *   - getRecPos0() (int)  e getRecPos0Long() (long)
+ *   - closeQuietly()
  */
 public final class CmpReader implements AutoCloseable {
 
     // ==== Constantes de layout a partir da especificação ====
     private static final int FILE_HEADER_SIZE = 1024;
-    private static final int SEGMENT_RECORD_SIZE = 8192; // cada segmento ocupa 8192 bytes
-    // Offsets dentro do File Header (sem padding, ints seguidos por longs etc.)
+    public  static final int SEGMENT_RECORD_SIZE = 8192; // cada segmento ocupa 8192 bytes
+
+    // Offsets dentro do File Header (ints/longs encadeados)
     private static final int FH_DIRTY    = 0;                // int
-    private static final int FH_IDENT    = FH_DIRTY + 4;     // int (pode não bater em arquivos antigos)
+    private static final int FH_IDENT    = FH_DIRTY + 4;     // int
     private static final int FH_VERSION  = FH_IDENT + 4;     // int
     private static final int FH_OT_POS   = FH_VERSION + 4;   // long
     private static final int FH_HDR_POS  = FH_OT_POS + 8;    // long
@@ -54,11 +62,17 @@ public final class CmpReader implements AutoCloseable {
     // Base efetiva da tabela (OT_pos ou OT_pos+8) escolhida por plausibilidade
     private long offsetTableBase;
 
+    /* ========= Fábrica compatível com AnalyzeSegment ========= */
+    public static CmpReader open(String path) throws IOException {
+        CmpReader r = new CmpReader(Paths.get(path));
+        r.open();
+        return r;
+    }
+
+    /* ========= Construtor/abertura ========= */
     public CmpReader(Path basePath) {
         this.basePath = basePath;
     }
-
-    // ============ Abertura ============
 
     public void open() throws IOException {
         if (!Files.isRegularFile(basePath)) {
@@ -106,7 +120,7 @@ public final class CmpReader implements AutoCloseable {
         // Decide a base real da tabela de offsets: OT_pos ou OT_pos+8
         this.offsetTableBase = chooseOffsetTableBase(size);
 
-        // Opcional: se recLen == 0 em alguns arquivos antigos, normalizamos para 8192
+        // Normaliza recLen se necessário
         if (this.recLen <= 0) this.recLen = SEGMENT_RECORD_SIZE;
     }
 
@@ -199,25 +213,23 @@ public final class CmpReader implements AutoCloseable {
         int score0 = probeOffsetBase(base0, n, fileSize);
         int score8 = probeOffsetBase(base8, n, fileSize);
 
-        // escolhe a que tiver mais hits plausíveis
         long base = (score8 > score0) ? base8 : base0;
 
-        // como sanity-check final, garanta que recPos0 esteja depois da tabela escolhida + hdrLen
+        // sanity: recPos0 deve estar depois da tabela escolhida + hdrLen
         long expectedMin = base + n * 8L + hdrLen;
         if (recPos0 < expectedMin - 64) {
-            // se a escolha ficou inconsistente, volte para a outra
             base = (base == base8) ? base0 : base8;
         }
         return base;
     }
 
-    // Verifica as primeiras/últimas 16 entradas dessa base: quantas são (0) ou offsets válidos (< recPos1).
+    // Verifica as primeiras/últimas entradas: quantas são (0) ou offsets válidos (< recPos1).
     private int probeOffsetBase(long base, long n, long fileSize) {
         int hits = 0;
         ByteBuffer bb = fileBuf.duplicate().order(order);
 
-        // amostra do início
         int take = (int) Math.min(16, n);
+        // início
         for (int i = 0; i < take; i++) {
             long pos = base + i * 8L;
             if (pos < 0 || pos + 8 > fileSize) break;
@@ -225,8 +237,7 @@ public final class CmpReader implements AutoCloseable {
             long off = bb.getLong();
             if (off == 0 || (off > 0 && off < recPos1)) hits++;
         }
-
-        // amostra do fim
+        // fim
         for (int i = 0; i < take; i++) {
             long pos = base + (n - 1 - i) * 8L;
             if (pos < 0 || pos + 8 > fileSize) break;
@@ -240,19 +251,64 @@ public final class CmpReader implements AutoCloseable {
     // ============ API pública usada pelo AnalyzeSegment / MainDemo ============
 
     public Path getBasePath() { return basePath; }
+
+    /** Compatível com AnalyzeSegment */
+    public ByteOrder getOrder()     { return order; }
     public ByteOrder getByteOrder() { return order; }
-    public long getOtPos() { return otPos; }
-    public long getHdrPos() { return hdrPos; }
-    public long getRecPos0() { return recPos0; }
-    public long getRecPos1() { return recPos1; }
-    public int getHdrLen() { return hdrLen; }
-    public int getRecLen() { return recLen; }
-    public int getMin1() { return min1; }
-    public int getMax1() { return max1; }
-    public int getMin2() { return min2; }
-    public int getMax2() { return max2; }
-    public int getMin3() { return min3; }
-    public int getMax3() { return max3; }
+
+    // Sempre retorna um ByteBuffer válido; se ainda não estiver mapeado, mapeia agora.
+    public ByteBuffer getFileBuffer() {
+        if (fileBuf == null) {
+            ensureMapped();
+        }
+        return fileBuf.duplicate();
+    }
+
+    // Versão que falha com mensagem clara (use esta no AnalyzeSegment)
+    public ByteBuffer requireFileBuffer() {
+        if (fileBuf == null) {
+            ensureMapped();
+            if (fileBuf == null) {
+                throw new IllegalStateException("CmpReader: fileBuf ainda é null após tentar mapear. " +
+                        "Verifique se CmpReader.open(path) foi chamado e se o arquivo existe/é legível.");
+            }
+        }
+        return fileBuf.duplicate();
+    }
+
+    // Re-mapeia se necessário
+    private void ensureMapped() {
+        try {
+            if (ch != null && ch.isOpen() && fileBuf == null) {
+                long size = ch.size();
+                fileBuf = ch.map(FileChannel.MapMode.READ_ONLY, 0, size);
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException("CmpReader.ensureMapped: falha ao mapear arquivo", e);
+        }
+    }
+
+    // (opcional) utilitário
+    public boolean isOpen() {
+        return ch != null && ch.isOpen();
+    }
+
+    public long  getOtPos()  { return otPos; }
+    public long  getHdrPos() { return hdrPos; }
+
+    /** AnalyzeSegment espera int; fornecemos ambos. */
+    public int   getRecPos0()     { return (int) recPos0; }
+    public long  getRecPos0Long() { return recPos0; }
+
+    public long  getRecPos1() { return recPos1; }
+    public int   getHdrLen()  { return hdrLen; }
+    public int   getRecLen()  { return recLen; }
+    public int   getMin1()    { return min1; }
+    public int   getMax1()    { return max1; }
+    public int   getMin2()    { return min2; }
+    public int   getMax2()    { return max2; }
+    public int   getMin3()    { return min3; }
+    public int   getMax3()    { return max3; }
 
     public long getSegmentsCount() {
         long nx = (long) (max1 - min1 + 1);
@@ -298,7 +354,7 @@ public final class CmpReader implements AutoCloseable {
         long i1 = seg1 - (long) min1;
         long i2 = seg2 - (long) min2;
         long i3 = seg3 - (long) min3;
-        long idx = i3 * nx * ny + i2 * nx + i1; // ordem 3,2,1 (lento->rápido). :contentReference[oaicite:7]{index=7}
+        long idx = i3 * nx * ny + i2 * nx + i1;
 
         long entryPos = offsetTableBase + idx * 8L;
         if (entryPos < 0 || entryPos + 8 > fileBuf.limit()) {
@@ -315,11 +371,22 @@ public final class CmpReader implements AutoCloseable {
             throw new IllegalStateException("Segment exceeds mapped file: start=" + recStart);
         }
 
-        // Delega o parse para o SegmentRecord (ele lida com metadados + huffman + payload). :contentReference[oaicite:8]{index=8}
         return SegmentRecord.parse(fileBuf, (int) recStart, order);
+    }
+
+    /* Utilitário para pegar os bytes de um record arbitrário (útil em montagens). */
+    public ByteBuffer sliceRecordBytes(long recStart) {
+        ByteBuffer d = fileBuf.duplicate();
+        d.position((int) recStart);
+        d.limit((int) recStart + SEGMENT_RECORD_SIZE);
+        return d.slice();
     }
 
     @Override public void close() throws IOException {
         if (ch != null && ch.isOpen()) ch.close();
+    }
+
+    public void closeQuietly() {
+        try { close(); } catch (Exception ignore) {}
     }
 }

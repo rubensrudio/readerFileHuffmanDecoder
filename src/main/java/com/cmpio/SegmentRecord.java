@@ -234,10 +234,19 @@ public final class SegmentRecord {
     }
 
     private static ByteBuffer slice(ByteBuffer src, int pos, int len) {
+        if (src == null) {
+            throw new IllegalStateException("slice: src(ByteBuffer) é null — verifique o retorno de CmpReader.getFileBuffer().");
+        }
+        if (pos < 0 || len < 0 || pos + len > src.capacity()) {
+            throw new IllegalArgumentException(String.format(
+                    "slice fora dos limites: pos=%d len=%d cap=%d", pos, len, src.capacity()));
+        }
         ByteBuffer d = src.duplicate();
-        d.position(pos); d.limit(pos + len);
+        d.position(pos);
+        d.limit(pos + len);
         return d.slice();
     }
+
 
     /** Utilitário: hexdump local (debug). */
     public static String dumpAround(ByteBuffer fileBuf, int recStart, int center, int span) {
