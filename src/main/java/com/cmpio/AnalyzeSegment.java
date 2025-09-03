@@ -19,20 +19,27 @@ public final class AnalyzeSegment {
 
         CmpReader reader = CmpReader.open(path.toAbsolutePath().toString());
         try {
+            // 1) Header
             ByteOrder order = reader.getOrder();
-
             System.out.println("=== CMP Header Summary ===");
             System.out.println("Arquivo: " + path);
             System.out.println("Byte order: " + (order == ByteOrder.BIG_ENDIAN ? "BIG_ENDIAN" : "LITTLE_ENDIAN"));
-            System.out.println("=======================================");
+            System.out.printf("OT_pos=%d, HDR_pos=%d, REC_pos_0=%d, REC_pos_1=%d%n",
+                    reader.getOtPos(), reader.getHdrPos(), reader.getRecPos0(), reader.getRecPos1());
+            System.out.println("==============================================");
 
-            System.out.println("Nenhum (seg1,seg2,seg3) informado. Usando o primeiro não-vazio: (0,0,0)");
+            // 2) Buffer do arquivo (garante não-nulo)
+            ByteBuffer file = reader.getFileBuffer();
+            if (file == null) {
+                throw new IllegalStateException("CmpReader.getFileBuffer() retornou null. " +
+                        "Verifique se CmpReader.open(path) foi chamado com sucesso.");
+            }
 
-            final int recStart = reader.getRecPos0();       // início do primeiro record
-            final ByteBuffer file = reader.requireFileBuffer(); // <- garante não-null
-
-            // Parse do record e Stage 2
+            // 3) Parse do record inicial (REC_pos_0)
+            final int recStart = reader.getRecPos0();
             SegmentRecord rec = SegmentRecord.parse(file, recStart, order);
+
+            // 4) Stage 2: monta bitstream multi-record e auto-prova bit order/invert/shift
             Stage2Analyzer.analyze(file, recStart, order, rec);
 
         } finally {

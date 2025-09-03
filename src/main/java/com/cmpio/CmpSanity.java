@@ -1,245 +1,128 @@
 package com.cmpio;
 
-import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.util.HashSet;
+import java.nio.file.Path;
+import java.util.Objects;
 
+/**
+ * Utilitários de checagem/diagnóstico ("sanidade") para arquivos CMP.
+ * - Imprime um resumo do header
+ * - Escolhe um segmento para inspeção (o informado, ou o primeiro não-vazio)
+ * - Faz inspeção leve do SegmentRecord (Huffman, payload, bits disponíveis/requeridos)
+ *
+ * Observação: CmpSanity NÃO decodifica o payload; isso fica a cargo do Stage2Analyzer.
+ */
 public final class CmpSanity {
+
     private CmpSanity() {}
 
-    /* =========================================================
-     * Checks e helpers básicos
-     * ========================================================= */
-    public static void requireState(boolean cond, String msg) {
-        if (!cond) throw new IllegalStateException(msg);
-    }
-    public static void requireArgument(boolean cond, String msg) {
-        if (!cond) throw new IllegalArgumentException(msg);
-    }
+    /** Imprime o cabeçalho resumido – igual ao que você vinha vendo nos logs. */
+    public static void printHeaderSummary(CmpReader rd) {
+        Objects.requireNonNull(rd, "CmpReader null");
 
-    public static int clamp(int v, int lo, int hi) {
-        return Math.max(lo, Math.min(hi, v));
-    }
+        final Path p = rd.getBasePath();
+        final ByteOrder order = rd.getByteOrder();
 
-    public static int bitsToBytesCeil(long bits) {
-        if (bits <= 0) return 0;
-        long b = (bits + 7) >>> 3;
-        return (b > Integer.MAX_VALUE) ? Integer.MAX_VALUE : (int) b;
-    }
+        System.out.println("=== CMP Header Summary ===");
+        System.out.println("Arquivo: " + p);
+        System.out.println("Byte order: " + (order == ByteOrder.BIG_ENDIAN ? "BIG_ENDIAN" : "LITTLE_ENDIAN"));
+        System.out.println("==============================================");
 
-    public static long bytesToBits(long bytes) {
-        return (bytes <= 0) ? 0L : (bytes << 3);
-    }
+        System.out.printf("OT_pos=%d, HDR_pos=%d, REC_pos_0=%d, REC_pos_1=%d%n",
+                rd.getOtPos(), rd.getHdrPos(), rd.getRecPos0(), rd.getRecPos1());
 
-    /* =========================================================
-     * Huffman: validações canônicas (Kraft), unicidade, histogramas
-     * ========================================================= */
+        long nx = (long) (rd.getMax1() - rd.getMin1() + 1);
+        long ny = (long) (rd.getMax2() - rd.getMin2() + 1);
+        long nz = (long) (rd.getMax3() - rd.getMin3() + 1);
+        long total = nx * ny * nz;
 
-    /** Verifica o critério de Kraft para comprimentos 1..32 (0 é ignorado). */
-    public static boolean kraftOk(int[] lengths) {
-        if (lengths == null || lengths.length == 0) return false;
-        int[] cnt = new int[33];
-        int maxL = 0, nz = 0;
-        for (int L : lengths) {
-            if (L < 0 || L > 32) return false;
-            if (L == 0) continue;
-            cnt[L]++; nz++; if (L > maxL) maxL = L;
-        }
-        if (nz < 1) return false;
-        int slots = 1;
-        for (int L = 1; L <= maxL; L++) {
-            slots = (slots << 1) - cnt[L];
-            if (slots < 0) return false;
-        }
-        return true;
-    }
-
-    public static boolean kraftOk(byte[] lengths) {
-        if (lengths == null) return false;
-        int[] tmp = new int[lengths.length];
-        for (int i = 0; i < lengths.length; i++) tmp[i] = lengths[i] & 0xFF;
-        return kraftOk(tmp);
-    }
-
-    /** Símbolos 0..255 e todos distintos. */
-    public static boolean allUnique(int[] symbols) {
-        if (symbols == null) return false;
-        HashSet<Integer> seen = new HashSet<>(symbols.length * 2);
-        for (int s : symbols) {
-            if (s < 0 || s > 255) return false;
-            if (!seen.add(s)) return false;
-        }
-        return true;
-    }
-
-    /** Histograma de comprimentos (1..maxL). */
-    public static int[] histogram(int[] lens, int maxL) {
-        int[] h = new int[Math.max(1, maxL + 1)];
-        if (lens == null) return h;
-        for (int L : lens) if (L >= 0 && L < h.length) h[L]++;
-        return h;
-    }
-
-    /* =========================================================
-     * Hexdump (debug)
-     * ========================================================= */
-    public static String hexdump(ByteBuffer buf, int offset, int len) {
-        if (buf == null) return "<null>";
-        ByteBuffer b = buf.duplicate();
-        offset = clamp(offset, 0, b.limit());
-        len = clamp(len, 0, b.limit() - offset);
-        b.position(offset);
-        b.limit(offset + len);
-        StringBuilder sb = new StringBuilder(len * 3 + (len / 16) * 8);
-        int col = 0;
-        int addr = offset;
-        while (b.hasRemaining()) {
-            int v = b.get() & 0xFF;
-            if (col == 0) sb.append(String.format("%08X: ", addr));
-            sb.append(String.format("%02X ", v));
-            addr++; col++;
-            if (col == 16) { sb.append('\n'); col = 0; }
-        }
-        if (col != 0) sb.append('\n');
-        return sb.toString();
-    }
-
-    /* =========================================================
-     * Prefix-probe (diagnóstico leve do bitstream)
-     * ========================================================= */
-
-    /** Constrói vetores first/last para códigos canônicos a partir dos comprimentos. */
-    public static void buildFirstLast(int[] lengths, int[] firstCode, int[] lastCode) {
-        int maxL = 0;
-        int[] cnt = new int[33];
-        for (int L : lengths) { if (L > 0) { cnt[L]++; if (L > maxL) maxL = L; } }
-        int code = 0;
-        for (int L = 1; L <= maxL; L++) {
-            code = (code + cnt[L - 1]) << 1;
-            firstCode[L] = code;
-            lastCode[L]  = code + cnt[L] - 1;
-        }
-    }
-
-    private static int peekMSB(byte[] data, long startBit, int n) {
-        int out = 0;
-        for (int i = 0; i < n; i++) {
-            long bit = startBit + i;
-            int b = data[(int) (bit >>> 3)] & 0xFF;
-            int sh = 7 - (int) (bit & 7);
-            out = (out << 1) | ((b >>> sh) & 1);
-        }
-        return out;
-    }
-
-    private static int peekLSB(byte[] data, long startBit, int n) {
-        int out = 0;
-        for (int i = 0; i < n; i++) {
-            long bit = startBit + i;
-            int b = data[(int) (bit >>> 3)] & 0xFF;
-            int sh = (int) (bit & 7);
-            out |= ((b >>> sh) & 1) << i;
-        }
-        return out;
-    }
-
-    private static boolean hitsPrefix(int prefix, int k, int[] first, int[] last) {
-        int upto = Math.min(k, first.length - 1);
-        for (int L = 1; L <= upto; L++) {
-            int mask = (L == 32) ? -1 : ((1 << L) - 1);
-            int val  = prefix & mask;
-            int lo = first[L], hi = last[L];
-            if (hi >= lo && val >= lo && val <= hi) return true;
-        }
-        return false;
+        System.out.printf("Dimensões: MIN_1..MAX_1=%d..%d   MIN_2..MAX_2=%d..%d   MIN_3..MAX_3=%d..%d   (total=%d)%n",
+                rd.getMin1(), rd.getMax1(), rd.getMin2(), rd.getMax2(), rd.getMin3(), rd.getMax3(), total);
     }
 
     /**
-     * Teste rápido: verifica se os primeiros bytes de {@code payload} podem ser
-     * prefixo de algum código canônico definido por {@code codeLengths}.
-     * Retorna true em caso de "cheiro" positivo (diagnóstico, não prova).
+     * Decide qual segmento analisar:
+     * - se (s1,s2,s3) for nulo, usa o primeiro não-vazio encontrado na tabela de offsets;
+     * - caso contrário, usa o segmento solicitado.
+     * Retorna o trio (s1,s2,s3), ou null se não houver nenhum segmento com offset > 0.
      */
-    public static boolean prefixLooksLike(ByteBuffer payload, int[] codeLengths, int sampleBytes) {
-        if (payload == null || codeLengths == null || codeLengths.length == 0) return false;
-        ByteBuffer p = payload.duplicate();
-        int take = Math.min(Math.max(8, sampleBytes), Math.min(128, p.remaining()));
-        if (take <= 0) return false;
+    public static int[] chooseSegmentOrFirstNonEmpty(CmpReader rd, int[] requested) {
+        Objects.requireNonNull(rd, "CmpReader null");
 
-        byte[] data = new byte[take];
-        p.get(data);
-
-        int maxL = 0;
-        for (int L : codeLengths) if (L > maxL) maxL = L;
-        int k = Math.min(24, Math.max(2, maxL));
-
-        int[] first = new int[33], last = new int[33];
-        buildFirstLast(codeLengths, first, last);
-
-        for (int bitShift = 0; bitShift < 8; bitShift++) {
-            long start = bitShift;
-            if ((long) data.length * 8L - start < k) break;
-            int msb = peekMSB(data, start, k);
-            int lsb = peekLSB(data, start, k);
-            if (hitsPrefix(msb, k, first, last)) return true;
-            if (hitsPrefix(lsb, k, first, last)) return true;
+        int[] chosen = requested;
+        if (chosen == null) {
+            int[] first = rd.findFirstNonEmpty();
+            if (first == null) {
+                System.out.println("Nenhum segmento não-vazio encontrado na tabela de offsets.");
+                return null;
+            }
+            chosen = first;
+            System.out.printf("Nenhum (seg1,seg2,seg3) informado. Usando o primeiro não-vazio: (%d,%d,%d)%n",
+                    chosen[0], chosen[1], chosen[2]);
+        } else {
+            System.out.printf("Segmento solicitado: (%d,%d,%d)%n", chosen[0], chosen[1], chosen[2]);
         }
-        return false;
+        return chosen;
     }
 
-    /* =========================================================
-     * Dumps de diagnóstico
-     * ========================================================= */
+    /**
+     * Faz uma inspeção leve do SegmentRecord:
+     * - imprime metadados encontrados (min/max, totalBits)
+     * - imprime características da Huffman (N, maxlen, Kraft, histograma de comprimentos)
+     * - informa bytes/bits disponíveis no primeiro record e o início do payload
+     * - alerta se requiredBits > availableBits (bitstream multi-record)
+     */
+    public static void quickInspect(CmpReader rd, int s1, int s2, int s3) {
+        Objects.requireNonNull(rd, "CmpReader null");
 
-    public static void dumpHuffmanSummary(SegmentRecord.HuffmanTable ht,
-                                          long requiredBits,
-                                          int availableBits,
-                                          int payloadStartByte) {
-        if (ht == null) {
-            System.out.println("Huffman: <null>");
-            return;
-        }
-        int n = ht.symbolCount;
-        int[] lens = ht.codeLengths != null ? ht.codeLengths : new int[0];
-        int maxL = 0, nz = 0;
-        for (int L : lens) { if (L > 0) { nz++; if (L > maxL) maxL = L; } }
+        SegmentRecord rec = rd.readSegmentRecord(s1, s2, s3);
 
-        int[] hist = histogram(lens, Math.max(32, maxL));
-        System.out.printf("Huffman N=%d, maxLen=%d, nonZeroLens=%d, kraftOk=%s%n",
-                n, maxL, nz, kraftOk(lens));
+        // Cabeçalho do record
+        System.out.printf("Segment parsed: minDelta=%.6f maxDelta=%.6f, N=%d, base=?," +
+                        " layout=SYM_LEN, lensEnc=nibbles(hi->lo), payloadStart=%d%n",
+                rec.md.minDelta, rec.md.maxDelta,
+                rec.huffman.symbols.length,
+                rec.payloadStart);
 
-        StringBuilder sb = new StringBuilder("Lengths histogram:");
-        for (int L = 1; L <= Math.max(1, maxL); L++) {
-            if (hist[L] != 0) sb.append(' ').append(L).append(':').append(hist[L]);
-        }
-        System.out.println(sb.toString());
+        // Huffman info
+        System.out.printf("Huffman N=%d, maxlen=%d, nonZeroLens=%d, kraftOk=%s%n",
+                rec.huffman.symbols.length, rec.huffman.maxLen,
+                rec.huffman.nonZeroLens, rec.huffman.kraftOk);
+
+        System.out.printf("Lengths histogram: %s%n", lengthsHistogram(rec.huffman.lens));
+
+        // Bits disponíveis x requeridos
+        final int payloadBytes = (rec.payloadSlice != null) ? rec.payloadSlice.remaining() : 0;
+        final long availableBits = (long) payloadBytes * 8L;
+        final long requiredBits  = rec.md.totalBits;
 
         System.out.printf("requiredBits=%d, availableBits=%d, payloadStartByte=%d%n",
-                requiredBits, availableBits, payloadStartByte);
+                requiredBits, availableBits, rec.payloadStart);
+
+        if (requiredBits > availableBits) {
+            int missingBytes = (int) (((requiredBits - availableBits) + 7) >>> 3);
+            System.out.printf("Aviso: requiredBits=%d > availableBits=%d (+%d bytes). " +
+                            "Provável bitstream multi-record — juntar bytes dos próximos records antes de decodificar.%n",
+                    requiredBits, availableBits, missingBytes);
+        }
     }
 
-    public static void dumpSegmentSummary(SegmentRecord rec, ByteOrder order) {
-        if (rec == null) {
-            System.out.println("Segment: <null>");
-            return;
+    // ======================
+    // Helpers
+    // ======================
+
+    private static String lengthsHistogram(int[] lens) {
+        int[] h = new int[16];
+        for (int L : lens) {
+            if (L >= 0 && L < 16) h[L]++;
         }
-        SegmentRecord.Metadata md = rec.metadata;
-        SegmentRecord.HuffmanTable ht = rec.huffman;
-
-        long requiredBits = (md != null) ? md.sumBits() : 0L;
-        int availableBits  = (rec.payloadSlice != null) ? rec.payloadSlice.remaining() * 8 : 0;
-
-        if (md != null) {
-            System.out.printf("Segment metadata: minDelta=%.6f maxDelta=%.6f totalBits=%d%n",
-                    md.minDelta, md.maxDelta, requiredBits);
-        } else {
-            System.out.println("Segment metadata: <null>");
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < h.length; i++) {
+            if (h[i] != 0) {
+                if (sb.length() != 0) sb.append(' ');
+                sb.append(i).append(':').append(h[i]);
+            }
         }
-
-        dumpHuffmanSummary(ht, requiredBits, availableBits, ht != null ? ht.payloadStart : -1);
-
-        boolean prefixOk = (ht != null) && prefixLooksLike(rec.payloadSlice, ht.codeLengths, 64);
-        String bo = (order == null) ? "unknown" :
-                (order == ByteOrder.BIG_ENDIAN ? "BIG_ENDIAN" : "LITTLE_ENDIAN");
-        System.out.println("prefixProbe.anyHit=" + prefixOk + ", byteOrder=" + bo);
+        return sb.toString();
     }
 }
