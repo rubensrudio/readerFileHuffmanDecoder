@@ -3,6 +3,7 @@ package com.cmpio;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 
 /**
  * Executa a análise de um único segmento.
@@ -15,42 +16,59 @@ public final class AnalyzeSegment {
     private AnalyzeSegment() {}
 
     public static void main(String[] args) throws Exception {
-        final Path path = Path.of("D:\\tmp\\cmp_dir\\S_ANALYTIC_ZERODATUM_13.cmp");
+        Path cmpPath = Paths.get("D:\\tmp\\cmp_dir\\S_ANALYTIC_ZERODATUM_13.cmp");
+        try (CmpReader r = new CmpReader(cmpPath)) {
+            r.open();
 
-        CmpReader reader = CmpReader.open(path.toAbsolutePath().toString());
-        try {
-            // 1) Header
-            ByteOrder order = reader.getOrder();
             System.out.println("=== CMP Header Summary ===");
-            System.out.println("Arquivo: " + path);
-            System.out.println("Byte order: " + (order == ByteOrder.BIG_ENDIAN ? "BIG_ENDIAN" : "LITTLE_ENDIAN"));
+            System.out.println("Arquivo: " + r.getBasePath());
+            System.out.println("Byte order: " + r.getByteOrder());
             System.out.printf("OT_pos=%d, HDR_pos=%d, REC_pos_0=%d, REC_pos_1=%d%n",
-                    reader.getOtPos(), reader.getHdrPos(), reader.getRecPos0(), reader.getRecPos1());
+                    r.getOtPos(), r.getHdrPos(), r.getRecPos0(), r.getRecPos1());
             System.out.println("==============================================");
 
-            // 2) Buffer do arquivo (garante não-nulo)
-            ByteBuffer file = reader.getFileBuffer();
-            if (file == null) {
-                throw new IllegalStateException("CmpReader.getFileBuffer() retornou null. " +
-                        "Verifique se CmpReader.open(path) foi chamado com sucesso.");
+            int[] first = r.findFirstNonEmpty();
+            if (first == null) {
+                System.out.println("Nenhum (seg1,seg2,seg3) com offset>0.");
+                return;
             }
+            int s1 = first[0], s2 = first[1], s3 = first[2];
+            System.out.printf("Usando o primeiro não-vazio: (%d,%d,%d)%n", s1, s2, s3);
 
-            // 3) Parse do record inicial (REC_pos_0)
-            final int recStart = reader.getRecPos0();
-            SegmentRecord rec = SegmentRecord.parse(file, recStart, order);
+            SegmentRecord rec = r.readSegmentRecord(s1, s2, s3);
+            ByteOrder order = r.getByteOrder();
+            ByteBuffer file = r.getFileBuffer();
 
-            // 4) Stage 2: monta bitstream multi-record e auto-prova bit order/invert/shift
-            Stage2Analyzer.analyze(file, recStart, order, rec);
+            // Resumo do record/huffman
+            int nonZero = 0, maxLen = 0;
+            for (int L : rec.huffman.lens) { if (L>0) { nonZero++; if (L>maxLen) maxLen=L; } }
+            System.out.printf("Segment parsed: minDelta=%.6f maxDelta=%.6f, N=%d, base=%d, layout=%s, lensEnc=%s, payloadStart=%d%n",
+                    rec.md.minDelta, rec.md.maxDelta, rec.huffman.N, rec.huffman.base,
+                    rec.huffman.layout, rec.huffman.lensEncoding, rec.md.payloadStartByte);
+            System.out.printf("Huffman Huffman{N=%d, maxLen=%d, nonZeroLens=%d, kraftOk=%s}%n",
+                    rec.huffman.N, maxLen, nonZero, rec.huffman.kraftOk);
 
-            // após obter 'rec' no AnalyzeSegment:
-            Stage3SymbolDump.run(file, recStart, order, rec);
+            int[] hist = new int[maxLen+1];
+            for (int L : rec.huffman.lens) if (L>=0 && L<hist.length) hist[L]++;
+            System.out.print("Lengths histogram:"); for (int L=1; L<hist.length; L++) if (hist[L]>0) System.out.print(" " + L + ":" + hist[L]); System.out.println();
 
-            // Depois de obter o 'rec' e antes de sair:
-            Stage3SymbolDumpPlus.run(file, recStart, order, rec, /*exportCsv=*/true, Path.of("cmp_stage3_out"));
+            long requiredBits = rec.md.totalBits;
+            long availableBits = (long) rec.md.payloadBytes * 8L;
+            System.out.printf("requiredBits=%d, availableBits=%d, payloadStartByte=%d%n",
+                    requiredBits, availableBits, rec.md.payloadStartByte);
 
+            // ===== Stage 4 v2 (human-readable grouping) =====
+            System.out.println("=== Stage 4 ===");
+            boolean splitOnly251 = true;      // modo recomendado
+            double padMergeThreshold = 0.70;  // >=70% 91 -> "padding"
+            Stage4TokenGrouper.run(file, rec.recStart, order, rec, splitOnly251, padMergeThreshold);
 
-        } finally {
-            reader.closeQuietly();
+            // ===== Stage 4.3 (Schema Extractor) =====
+            System.out.println("=== Stage 4.3 ===");
+            Path outDir = cmpPath.getParent() == null
+                    ? Paths.get("cmp_stage4_schema")
+                    : cmpPath.getParent().resolve("cmp_stage4_schema");
+            Stage4SchemaExtractor.run(file, rec.recStart, order, rec, outDir, padMergeThreshold);
         }
     }
 }

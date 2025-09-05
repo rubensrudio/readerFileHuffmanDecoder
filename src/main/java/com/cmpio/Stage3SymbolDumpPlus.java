@@ -131,7 +131,7 @@ public final class Stage3SymbolDumpPlus {
         // histograma de 0..255
         final long[] hist = new long[256];
 
-        // bigrams: matriz 256x256 (pode ser esparsa, mas nosso alfabeto é pequeno)
+        // bigrams: matriz 256x256
         final long[][] bi = new long[256][256];
 
         // trigrams: (a<<16 | b<<8 | c) -> contagem
@@ -183,7 +183,6 @@ public final class Stage3SymbolDumpPlus {
             }
         }
 
-        // flush final (para última run)
         void finish() {
             if (lastSym >= 0 && runLen > 0) {
                 runs.computeIfAbsent(lastSym, k -> new HashMap<>())
@@ -191,76 +190,6 @@ public final class Stage3SymbolDumpPlus {
                 lastSym = -1; runLen = 0;
             }
         }
-
-        // ================= Report helpers =================
-
-        void printTopHistogram(int topN) {
-            int[] idx = argsortDesc(hist);
-            System.out.println("Top " + topN + " símbolos:");
-            for (int i = 0, shown = 0; i < idx.length && shown < topN; i++) {
-                if (hist[idx[i]] == 0) break;
-                System.out.printf("  %3d: %d%n", idx[i], hist[idx[i]]);
-                shown++;
-            }
-        }
-
-        void printRunsFor(int sym, int topN) {
-            HashMap<Integer, Long> m = runs.get(sym);
-            if (m == null || m.isEmpty()) { System.out.println("Sem runs para " + sym); return; }
-            List<Map.Entry<Integer, Long>> list = new ArrayList<>(m.entrySet());
-            list.sort((a,b) -> Long.compare(b.getValue(), a.getValue()));
-            System.out.println("Top runs para símbolo " + sym + ":");
-            int shown = 0;
-            for (Map.Entry<Integer, Long> e : list) {
-                System.out.printf("  len=%d -> %d%n", e.getKey(), e.getValue());
-                if (++shown >= topN) break;
-            }
-        }
-
-        void printRarePositions() {
-            for (int r : rareSet) {
-                ArrayList<Long> lst = rarePos.get(r);
-                if (lst == null || lst.isEmpty()) continue;
-                System.out.print("Posições (amostra) de " + r + ": ");
-                for (int i = 0; i < lst.size(); i++) {
-                    if (i > 0) System.out.print(", ");
-                    System.out.print(lst.get(i));
-                }
-                System.out.println();
-            }
-        }
-
-        void printTopTransitionsFrom(int sym, int topN) {
-            long[] row = bi[sym];
-            if (row == null) return;
-            Integer[] idx = new Integer[256];
-            for (int i=0;i<256;i++) idx[i] = i;
-            Arrays.sort(idx, (a,b)-> Long.compare(row[b], row[a]));
-            System.out.println("Transições a partir de " + sym + " (top " + topN + "):");
-            int shown=0;
-            for (int i=0;i<256 && shown<topN;i++) {
-                if (row[idx[i]] == 0) break;
-                System.out.printf("  %3d -> %3d : %d%n", sym, idx[i], row[idx[i]]);
-                shown++;
-            }
-        }
-
-        void printTopTrigrams(int topN) {
-            List<Map.Entry<Integer, Long>> list = new ArrayList<>(tri.entrySet());
-            list.sort((a,b) -> Long.compare(b.getValue(), a.getValue()));
-            System.out.println("Top " + topN + " trigrams:");
-            int shown=0;
-            for (Map.Entry<Integer, Long> e : list) {
-                int key = e.getKey();
-                int a = (key >>> 16) & 0xFF;
-                int b = (key >>> 8) & 0xFF;
-                int c = key & 0xFF;
-                System.out.printf("  [%3d,%3d,%3d] : %d%n", a,b,c,e.getValue());
-                if (++shown >= topN) break;
-            }
-        }
-
-        // ================= CSV =================
 
         String toCsvHistogram() {
             StringBuilder sb = new StringBuilder("symbol,count\n");
@@ -310,34 +239,60 @@ public final class Stage3SymbolDumpPlus {
     private static void report(SegmentRecord rec, Stats s, int topN) {
         s.finish();
 
+        // computa maxLen atual a partir de rec.huffman.lens
+        int maxLen = 0;
+        for (int L : rec.huffman.lens) if (L > maxLen) maxLen = L;
+
         System.out.println("=== Stage 3+ Summary ===");
         System.out.printf("Tokens decodificados: %d%n", s.totalTokens);
         System.out.printf("Huffman: N=%d, maxLen=%d, payloadStart=%d%n",
-                rec.huffman.symbols.length, rec.huffman.maxLen, rec.payloadStart);
+                rec.huffman.N, maxLen, rec.md.payloadStartByte);
         System.out.println();
 
-        s.printTopHistogram(topN);
+        // Top histogram
+        int shown = 0;
+        int[] order = argsortDesc(s.hist);
+        System.out.println("Top " + topN + " símbolos:");
+        for (int i = 0; i < order.length && shown < topN; i++) {
+            if (s.hist[order[i]] == 0) break;
+            System.out.printf("  %3d: %d%n", order[i], s.hist[order[i]]);
+            shown++;
+        }
         System.out.println();
-        s.printTopTrigrams(Math.min(topN, 30));
+
+        // Top trigrams
+        List<Map.Entry<Integer, Long>> tri = new ArrayList<>(s.tri.entrySet());
+        tri.sort((a,b)-> Long.compare(b.getValue(), a.getValue()));
+        System.out.println("Top " + Math.min(topN, 30) + " trigrams:");
+        int shownTri = 0;
+        for (Map.Entry<Integer, Long> e : tri) {
+            if (shownTri >= Math.min(topN, 30)) break;
+            int key = e.getKey();
+            int a = (key >>> 16) & 0xFF;
+            int b = (key >>> 8) & 0xFF;
+            int c = key & 0xFF;
+            System.out.printf("  [%3d,%3d,%3d] : %d%n", a,b,c,e.getValue());
+            shownTri++;
+        }
         System.out.println();
 
         // foco em 91 (suspeita de RLE)
         System.out.println("---- Runs por símbolo ----");
-        s.printRunsFor(91, topN);
+        printRunsFor(s, 91, topN);
         System.out.println();
 
         // transições a partir dos tokens mais frequentes (pegar top 3 do hist)
-        int[] top = argsortDesc(s.hist);
-        int shown = 0;
-        for (int i=0;i<top.length && shown<3;i++) {
+        int[] top = order;
+        int showFrom = 0;
+        for (int i=0; i<top.length && showFrom<3; i++) {
             if (s.hist[top[i]] == 0) break;
-            s.printTopTransitionsFrom(top[i], topN);
+            printTopTransitionsFrom(s, top[i], topN);
             System.out.println();
-            shown++;
+            showFrom++;
         }
 
         // posições dos raros (amostra)
-        s.printRarePositions();
+        printRarePositions(s);
 
         // heurísticas
         int uniques = 0;
@@ -347,5 +302,47 @@ public final class Stage3SymbolDumpPlus {
         System.out.printf("Heurísticas: zero=%d, one=%d, únicos=%d%n", zero, one, uniques);
         System.out.println("Se 91 domina e há runs longas, provável RLE (ex.: 91 = ZERO_RUN).");
         System.out.println("Tokens 63/95/195/210/249/251 sugerem marcadores de bloco/controle.");
+    }
+
+    private static void printRarePositions(Stats s) {
+        int[] rare = {63, 95, 195, 210, 249, 251};
+        for (int r : rare) {
+            ArrayList<Long> lst = s.rarePos.get(r);
+            if (lst == null || lst.isEmpty()) continue;
+            System.out.print("Posições (amostra) de " + r + ": ");
+            for (int i = 0; i < lst.size(); i++) {
+                if (i > 0) System.out.print(", ");
+                System.out.print(lst.get(i));
+            }
+            System.out.println();
+        }
+    }
+
+    private static void printRunsFor(Stats s, int sym, int topN) {
+        HashMap<Integer, Long> m = s.runs.get(sym);
+        if (m == null || m.isEmpty()) { System.out.println("Sem runs para " + sym); return; }
+        List<Map.Entry<Integer, Long>> list = new ArrayList<>(m.entrySet());
+        list.sort((a,b) -> Long.compare(b.getValue(), a.getValue()));
+        System.out.println("Top runs para símbolo " + sym + ":");
+        int shown = 0;
+        for (Map.Entry<Integer, Long> e : list) {
+            System.out.printf("  len=%d -> %d%n", e.getKey(), e.getValue());
+            if (++shown >= topN) break;
+        }
+    }
+
+    private static void printTopTransitionsFrom(Stats s, int sym, int topN) {
+        long[] row = s.bi[sym];
+        if (row == null) return;
+        Integer[] idx = new Integer[256];
+        for (int i=0;i<256;i++) idx[i] = i;
+        Arrays.sort(idx, (a,b)-> Long.compare(row[b], row[a]));
+        System.out.println("Transições a partir de " + sym + " (top " + topN + "):");
+        int shown=0;
+        for (int i=0;i<256 && shown<topN;i++) {
+            if (row[idx[i]] == 0) break;
+            System.out.printf("  %3d -> %3d : %d%n", sym, idx[i], row[idx[i]]);
+            shown++;
+        }
     }
 }

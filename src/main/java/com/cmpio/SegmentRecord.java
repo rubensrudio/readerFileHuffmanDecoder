@@ -6,55 +6,83 @@ import java.util.Arrays;
 import java.util.Objects;
 
 /**
- * Parser de um Segment Record (8192 bytes) com heurísticas robustas:
- * - Localiza/valida a tabela Huffman (layout SYM_LEN + nibbles hi->lo)
- * - Evita falsos-positivos (N muito pequeno, payloadStart baixo, prefix-probe falhando)
- * - Determina payloadStart, payloadSlice e totalBits (com janela plausível)
+ * Parser de um Segment Record (8192 bytes) com heurísticas robustas.
+ * Exposição compatível com AnalyzeSegment:
+ *  - recStart
+ *  - md: minDelta, maxDelta, totalBits, payloadStartByte, payloadBytes
+ *  - huffman: N, base, layout, lensEncoding, symbols, lens, kraftOk
  */
 public final class SegmentRecord {
 
     public static final int RECORD_SIZE = 8192;
 
-    // Parâmetros de heurística
-    private static final int SCAN_START = 256;        // início da varredura de candidatos
-    private static final int SCAN_END   = 1024;       // fim (exclusivo)
-    private static final int MIN_PAYLOAD_START = 512; // evita “cabos” no começo do record
-    private static final int MAX_PREVIEW_BYTES  = 256;// bytes para prefix-probe (dentro do record)
-    private static final int MAX_STITCHED_RECORDS = 8;// teto para requiredBits plausível (8 records)
+    // Heurística de busca
+    private static final int SCAN_START = 256;
+    private static final int SCAN_END   = 1024;
+    private static final int MIN_PAYLOAD_START = 512;
+    private static final int MAX_PREVIEW_BYTES = 256;
+    private static final int MAX_STITCHED_RECORDS = 8;
 
-    /** Metadados mínimos necessários para stage 2. */
+    // ======= Tipos expostos =======
+
+    /** Metadados do record. */
     public static final class Metadata {
         public double minDelta;
         public double maxDelta;
+
+        /** total de bits a consumir no bitstream (após montagem multi-record). */
         public long   totalBits;
+
+        /** offset (em bytes) do payload dentro do record (0..8192). */
+        public int    payloadStartByte;
+
+        /** bytes disponíveis no payload deste record (8192 - payloadStartByte). */
+        public int    payloadBytes;
+
         @Override public String toString() {
-            return String.format("Metadata{minDelta=%.6f maxDelta=%.6f totalBits=%d}", minDelta, maxDelta, totalBits);
+            return String.format("Metadata{minDelta=%.6f maxDelta=%.6f totalBits=%d payloadStart=%d payloadBytes=%d}",
+                    minDelta, maxDelta, totalBits, payloadStartByte, payloadBytes);
         }
     }
 
-    /** Tabela de Huffman (símbolos + comprimentos 0..15). */
-    public static final class Huffman {
-        public int[] symbols;
-        public int[] lens;
-        public int   maxLen;
-        public int   nonZeroLens;
-        public boolean kraftOk;
+    /** Tabela Huffman detectada. */
+    public static final class HuffmanInfo {
+        public int    N;                // quantidade de símbolos da tabela
+        public int    base;             // posição (offset) dentro do record onde a tabela começa
+        public String layout;           // "SYM_LEN"
+        public String lensEncoding;     // "nibbles(hi->lo)"
+        public int[]  symbols;          // 0..255
+        public int[]  lens;             // 0..15, mesmo comprimento de symbols
+        public boolean kraftOk;         // resultado do teste de Kraft
+
         @Override public String toString() {
-            return "Huffman{N=" + symbols.length +
-                    ", maxlen=" + maxLen +
-                    ", nonZeroLens=" + nonZeroLens +
-                    ", kraftOk=" + kraftOk + "}";
+            return "Huffman{N=" + N +
+                    ", kraftOk=" + kraftOk +
+                    ", layout=" + layout +
+                    ", lensEnc=" + lensEncoding + "}";
         }
     }
 
-    // Exposição ao Stage2
-    public Metadata   md;
-    public Huffman    huffman;
-    public int        payloadStart;
-    public ByteBuffer payloadSlice;
+    // ======= Campos expostos ao restante do pipeline =======
+    public final int recStart;      // offset do registro (8192 bytes) no arquivo
+    public final Metadata md;       // metadados
+    public final HuffmanInfo huffman; // tabela huffman
+    public final ByteBuffer payloadSlice; // janela deste record (somente bytes locais, sem costura)
 
-    private SegmentRecord() {}
+    // ======= Construção =======
+    private SegmentRecord(int recStart, Metadata md, HuffmanInfo h, ByteBuffer payloadSlice) {
+        this.recStart = recStart;
+        this.md = md;
+        this.huffman = h;
+        this.payloadSlice = payloadSlice;
+    }
 
+    /**
+     * Faz o parse de um registro (8192 bytes) a partir do arquivo mapeado.
+     * @param fileBuf  buffer do arquivo inteiro (mapeado)
+     * @param recStart offset do início do registro (8192 bytes)
+     * @param order    endianness do arquivo
+     */
     public static SegmentRecord parse(ByteBuffer fileBuf, int recStart, ByteOrder order) {
         if (fileBuf == null) throw new IllegalStateException("SegmentRecord.parse: fileBuf é null.");
         if (recStart < 0 || recStart + RECORD_SIZE > fileBuf.capacity()) {
@@ -64,20 +92,18 @@ public final class SegmentRecord {
 
         ByteBuffer rec = slice(fileBuf, recStart, RECORD_SIZE).order(order);
 
-        SegmentRecord out = new SegmentRecord();
-        out.md = new Metadata();
-
-        // leitura opcional de min/max (apenas informativo)
+        // 0) min/max (opcional; muitos arquivos têm 0.0/0.0)
+        Metadata md = new Metadata();
         try {
             double d0 = rec.getDouble(0), d1 = rec.getDouble(8);
-            if (!Double.isNaN(d0)) out.md.minDelta = d0;
-            if (!Double.isNaN(d1)) out.md.maxDelta = d1;
+            if (!Double.isNaN(d0)) md.minDelta = d0;
+            if (!Double.isNaN(d1)) md.maxDelta = d1;
         } catch (Throwable ignore) {}
 
-        // ===== 1) Prospecção de candidatos de Huffman =====
+        // 1) Scaneia candidatos de tabela Huffman (SYM_LEN + nibbles hi->lo)
         HuffmanFound best = null;
         for (int base = SCAN_START; base < SCAN_END; base++) {
-            for (int N = 2; N <= 64; N++) { // expandido até 64 (tabelas “reais” costumam estar ~32..48)
+            for (int N = 2; N <= 64; N++) {
                 int bytesLens = (N + 1) >> 1;
                 int end = base + N + bytesLens;
                 if (end > RECORD_SIZE) break;
@@ -96,38 +122,34 @@ public final class SegmentRecord {
 
                 if (!lensInRange(lens)) continue;
                 if (!allUnique(syms))   continue;
+                if (!kraftOK(lens))     continue;
 
                 int nonZero = 0, maxLen = 0;
                 for (int L : lens) if (L > 0) { nonZero++; if (L > maxLen) maxLen = L; }
                 if (nonZero < 2) continue;
-                if (!kraftOK(lens)) continue;
 
                 int payloadStart = align16(end);
+                if (payloadStart < MIN_PAYLOAD_START || payloadStart >= RECORD_SIZE) continue;
 
-                // ========= Scoring inicial (filtro rápido) =========
+                // score
                 int score = 0;
-                if (N >= 3) score += 3;                          // preferir tabelas reais
-                if (payloadStart >= MIN_PAYLOAD_START) score += 3;
+                if (N >= 3) score += 3;
                 if (payloadStart % 16 == 0) score += 1;
-                score += Math.min(maxLen, 8);                    // maxLen razoável ajuda
-                score += nonZero;                                // mais códigos ativos
-                if (N >= 32 && N <= 48) score += 4;              // preferência suave para zona onde N≈39 cai
+                score += Math.min(maxLen, 8);
+                score += nonZero;
+                if (N >= 32 && N <= 48) score += 4;
 
-                // ========= Prefix-probe forte (confirmação) =========
-                if (payloadStart >= RECORD_SIZE) continue;
+                // prefix-probe forte no próprio record (até 256 bytes)
                 int availBytes = Math.min(MAX_PREVIEW_BYTES, RECORD_SIZE - payloadStart);
                 if (availBytes <= 0) continue;
                 ByteBuffer pay = slice(rec, payloadStart, availBytes);
-
-                if (!tinyPrefixProbeStrong(syms, lens, pay)) continue; // descarta se não bater
+                if (!tinyPrefixProbeStrong(syms, lens, pay)) continue;
 
                 HuffmanFound cand = new HuffmanFound();
                 cand.base = base;
                 cand.N = N;
                 cand.syms = syms;
                 cand.lens = lens;
-                cand.maxLen = maxLen;
-                cand.nonZero = nonZero;
                 cand.payloadStart = payloadStart;
                 cand.score = score;
 
@@ -141,75 +163,69 @@ public final class SegmentRecord {
             throw new IllegalStateException("Huffman table não reconhecida: nenhum candidato passou no prefix-probe + sanidade.");
         }
 
-        // ===== 2) Consolidar Huffman e payload =====
-        out.huffman = new Huffman();
-        out.huffman.symbols = best.syms;
-        out.huffman.lens    = best.lens;
-        out.huffman.maxLen  = best.maxLen;
-        out.huffman.nonZeroLens = best.nonZero;
-        out.huffman.kraftOk = true;
+        // 2) Consolidar huffman + payload
+        HuffmanInfo h = new HuffmanInfo();
+        h.N = best.N;
+        h.base = best.base;
+        h.layout = "SYM_LEN";
+        h.lensEncoding = "nibbles(hi->lo)";
+        h.symbols = best.syms;
+        h.lens    = best.lens;
+        h.kraftOk = true;
 
-        out.payloadStart = best.payloadStart;
-        out.payloadSlice = slice(rec, out.payloadStart, RECORD_SIZE - out.payloadStart);
+        md.payloadStartByte = best.payloadStart;
+        md.payloadBytes = RECORD_SIZE - md.payloadStartByte;
 
-        int payloadBytes = out.payloadSlice.remaining();
-        long availableBits = (long) payloadBytes * 8L;
+        ByteBuffer payloadSlice = slice(rec, md.payloadStartByte, md.payloadBytes);
 
-        // ===== 3) totalBits (padrão com janela plausível + caps) =====
-        long hardCapBits = (long) RECORD_SIZE * 8L * MAX_STITCHED_RECORDS; // p.ex. 8 records
-        long softCapBits = 200_000L;                                       // heurística para este dataset
+        // 3) totalBits: tenta achar int plausível antes do payload; se falhar, fallback + caps
+        long availableBits = (long) md.payloadBytes * 8L;
+        long hardCapBits = (long) RECORD_SIZE * 8L * MAX_STITCHED_RECORDS; // ex.: 8 records
+        long softCapBits = 200_000L;                                       // heurístico
         long cap = Math.min(hardCapBits, softCapBits);
 
         long requiredBits = findReasonableBitsInt(
                 rec,
-                Math.max(0, out.payloadStart - 512),
-                Math.min(512, out.payloadStart),
+                Math.max(0, md.payloadStartByte - 512),
+                Math.min(512, md.payloadStartByte),
                 order,
                 availableBits,
                 cap
         );
 
         if (requiredBits <= availableBits || requiredBits > cap) {
-            long fallback = availableBits + (5500L << 3); // ~5.5 KiB adicionais
+            long fallback = availableBits + (5500L << 3); // ~5.5 KiB extra
             requiredBits = Math.min(fallback, cap);
         }
-        out.md.totalBits = requiredBits;
+        md.totalBits = requiredBits;
 
-        // ===== 4) Log amigável =====
-        System.out.printf("Segment parsed: minDelta=%.6f maxDelta=%.6f, N=%d, base=%d, layout=SYM_LEN, lensEnc=nibbles(hi->lo), payloadStart=%d%n",
-                out.md.minDelta, out.md.maxDelta, out.huffman.symbols.length, best.base, out.payloadStart);
-        System.out.printf("Huffman %s%n", out.huffman);
-        System.out.printf("Lengths histogram: %s%n", histLens(out.huffman.lens));
-        System.out.printf("requiredBits=%d, availableBits=%d, payloadStartByte=%d%n",
-                out.md.totalBits, availableBits, out.payloadStart);
-
-        return out;
+        // 4) monta objeto final
+        return new SegmentRecord(recStart, md, h, payloadSlice);
     }
 
-    // ====================== Helpers ======================
+    // ====== Helpers ======
 
     private static boolean lensInRange(int[] lens) {
         for (int L : lens) if (L < 0 || L > 15) return false;
         return true;
     }
     private static boolean allUnique(int[] a) {
-        for (int i = 0; i < a.length; i++) for (int j = i + 1; j < a.length; j++) if (a[i] == a[j]) return false;
+        for (int i = 0; i < a.length; i++)
+            for (int j = i + 1; j < a.length; j++)
+                if (a[i] == a[j]) return false;
         return true;
     }
     private static boolean kraftOK(int[] lens) {
         int max = 0; for (int L : lens) if (L > max) max = L;
         if (max <= 0) return false;
         long sum = 0, full = 1L << max;
-        for (int L : lens) if (L > 0) { sum += 1L << (max - L); if (sum > full) return false; }
+        for (int L : lens) if (L > 0) {
+            sum += 1L << (max - L);
+            if (sum > full) return false;
+        }
         return sum <= full;
     }
     private static int align16(int x) { int m = x & 15; return (m == 0) ? x : (x + (16 - m)); }
-    private static String histLens(int[] lens) {
-        int[] h = new int[16]; for (int L : lens) if (L >= 0 && L < 16) h[L]++;
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < h.length; i++) if (h[i] != 0) { if (sb.length()!=0) sb.append(' '); sb.append(i).append(':').append(h[i]); }
-        return sb.toString();
-    }
 
     /** Varre uma janela antes do payload à procura de um int “totalBits” plausível. */
     private static long findReasonableBitsInt(ByteBuffer rec,
@@ -238,23 +254,24 @@ public final class SegmentRecord {
         if (src == null) throw new IllegalStateException("slice: src é null.");
         if (pos < 0 || len < 0 || pos + len > src.capacity())
             throw new IllegalArgumentException(String.format("slice fora: pos=%d len=%d cap=%d", pos, len, src.capacity()));
-        ByteBuffer d = src.duplicate(); d.position(pos); d.limit(pos + len); return d.slice();
+        ByteBuffer d = src.duplicate();
+        d.position(pos);
+        d.limit(pos + len);
+        return d.slice();
     }
 
-    /** Estrutura temporária do melhor candidato. */
+    // ======= Estruturas auxiliares de detecção =======
     private static final class HuffmanFound {
-        int base, N, maxLen, nonZero, payloadStart, score;
+        int base, N, payloadStart, score;
         int[] syms, lens;
     }
 
-    // =================== Prefix-probe forte ===================
-    // Testa se algum prefixo do payload (dentro do próprio record) bate com a tabela
-    // para qualquer combinação MSB/LSB × invert × shifts 0..3.
+    // ======= Prefix-probe forte (sem depender de Stage2/3 externos) =======
     private static boolean tinyPrefixProbeStrong(int[] syms, int[] lens, ByteBuffer payload) {
         byte[] data = new byte[payload.remaining()];
         payload.duplicate().get(data);
-        Canon canon = Canon.fromSymbolsAndLengths(syms, lens);
 
+        Canon canon = Canon.fromSymbolsAndLengths(syms, lens);
         final boolean[] orders = { true, false };   // LSB/MSB
         final boolean[] invs   = { false, true };
 
@@ -281,28 +298,34 @@ public final class SegmentRecord {
             int s = decodeOne(root, br);
             if (s < 0) return false;
             decoded++;
-            if (seen[s] == 0) { seen[s] = 1; distinct++; }
+            if (s >= 0 && s < 256 && seen[s] == 0) { seen[s] = 1; distinct++; }
         }
         return (decoded >= 32 && distinct >= 4);
     }
 
-    // === Implementação mínima de Canon/árvore/bitreader (sem depender do Stage2Analyzer) ===
-
+    // === Implementação mínima para probe ===
     private static final class Canon {
         static final class Entry { final int sym,len; int codeMSB; Entry(int s,int l){sym=s;len=l;} }
         final Entry[] entries;
         Canon(Entry[] es){ entries=es; }
+
         static Canon fromSymbolsAndLengths(int[] syms, int[] lens) {
             int n = syms.length;
             Entry[] es = new Entry[n];
             int k=0;
             for (int i=0;i<n;i++) if (lens[i]>0) es[k++] = new Entry(syms[i], lens[i]);
             es = Arrays.copyOf(es, k);
-            Arrays.sort(es, (a,b)-> a.len!=b.len ? Integer.compare(a.len,b.len) : Integer.compare(a.sym,b.sym));
+            Arrays.sort(es, (a,b)-> a.len!=b.len ? Integer.compare(a.len,b.len)
+                    : Integer.compare(a.sym,b.sym));
             int code=0, prev=es.length>0?es[0].len:0;
-            for (Entry e: es){ if (e.len>prev){ code <<= (e.len-prev); prev=e.len; } e.codeMSB = code; code++; }
+            for (Entry e: es){
+                if (e.len>prev){ code <<= (e.len-prev); prev=e.len; }
+                e.codeMSB = code;
+                code++;
+            }
             return new Canon(es);
         }
+
         DecodeNode buildDecodeTree(boolean lsb) {
             DecodeNode root = new DecodeNode();
             for (Entry e: entries){
@@ -318,6 +341,7 @@ public final class SegmentRecord {
             }
             return root;
         }
+
         static int bitReverse(int v,int w){ int r=0; for(int i=0;i<w;i++){ r=(r<<1)|(v&1); v>>>=1; } return r; }
     }
     private static final class DecodeNode { boolean isLeaf; int symbol; DecodeNode zero,one; }
