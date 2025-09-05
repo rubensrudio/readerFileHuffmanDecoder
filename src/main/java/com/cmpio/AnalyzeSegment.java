@@ -57,18 +57,25 @@ public final class AnalyzeSegment {
             System.out.printf("requiredBits=%d, availableBits=%d, payloadStartByte=%d%n",
                     requiredBits, availableBits, rec.md.payloadStartByte);
 
-            // ===== Stage 4 v2 (human-readable grouping) =====
+            // ===== Stage 4 v2 =====
             System.out.println("=== Stage 4 ===");
-            boolean splitOnly251 = true;      // modo recomendado
-            double padMergeThreshold = 0.70;  // >=70% 91 -> "padding"
+            boolean splitOnly251 = true;
+            double padMergeThreshold = 0.70;
             Stage4TokenGrouper.run(file, rec.recStart, order, rec, splitOnly251, padMergeThreshold);
 
-            // ===== Stage 4.3 (Schema Extractor) =====
+            // ===== Stage 4.3 =====
             System.out.println("=== Stage 4.3 ===");
-            Path outDir = cmpPath.getParent() == null
+            Path outSchemaDir = cmpPath.getParent() == null
                     ? Paths.get("cmp_stage4_schema")
                     : cmpPath.getParent().resolve("cmp_stage4_schema");
-            Stage4SchemaExtractor.run(file, rec.recStart, order, rec, outDir, padMergeThreshold);
+            Stage4SchemaExtractor.run(file, rec.recStart, order, rec, outSchemaDir, padMergeThreshold);
+
+            // ===== Stage 5 =====
+            System.out.println("=== Stage 5 ===");
+            Path outStage5 = cmpPath.getParent() == null
+                    ? Paths.get("cmp_stage5_out")
+                    : cmpPath.getParent().resolve("cmp_stage5_out");
+            Stage5Reconstructor.run(file, rec.recStart, order, rec, outStage5);
         }
     }
 }
