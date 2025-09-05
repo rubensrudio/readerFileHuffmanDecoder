@@ -42,6 +42,13 @@ public final class AnalyzeSegment {
             // 4) Stage 2: monta bitstream multi-record e auto-prova bit order/invert/shift
             Stage2Analyzer.analyze(file, recStart, order, rec);
 
+            // após obter 'rec' no AnalyzeSegment:
+            Stage3SymbolDump.run(file, recStart, order, rec);
+
+            // Depois de obter o 'rec' e antes de sair:
+            Stage3SymbolDumpPlus.run(file, recStart, order, rec, /*exportCsv=*/true, Path.of("cmp_stage3_out"));
+
+
         } finally {
             reader.closeQuietly();
         }
