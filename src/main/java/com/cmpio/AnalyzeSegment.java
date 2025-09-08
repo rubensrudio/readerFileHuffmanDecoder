@@ -112,6 +112,25 @@ public final class AnalyzeSegment {
             Stage8Rebuilder.Result r8 = Stage8Rebuilder.run(outStage7);
             System.out.println("[Stage 8] " + r8);
 
+            // ===== Stage 9 =====
+            System.out.println("=== Stage 9 ===");
+            Path stage7Out = cmpPath.getParent() == null
+                    ? Paths.get("cmp_stage7_out")
+                    : cmpPath.getParent().resolve("cmp_stage7_out");
+            Path stage9Out = cmpPath.getParent() == null
+                    ? Paths.get("cmp_stage9_out")
+                    : cmpPath.getParent().resolve("cmp_stage9_out");
+
+            Stage9Stitcher.Result s9 = Stage9Stitcher.run(stage7Out, stage9Out);
+
+            // ===== Stage 10 =====
+            System.out.println("=== Stage 10 ===");
+            // Mapa default 1..5 -> identidade (ajuste quando tiver a tabela real)
+            Map<Integer,Integer> defaultMap = new LinkedHashMap<>();
+            for (int k = 1; k <= 5; k++) defaultMap.put(k, k);
+
+            Stage10Mapper.Result s10 = Stage10Mapper.run(stage9Out, defaultMap);
+
             System.out.println("[AnalyzeSegment] Concluído.");
         }
     }
