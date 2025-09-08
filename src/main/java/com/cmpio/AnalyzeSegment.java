@@ -131,6 +131,11 @@ public final class AnalyzeSegment {
 
             Stage10Mapper.Result s10 = Stage10Mapper.run(stage9Out, defaultMap);
 
+            // ===== Stage 11 (opcional) =====
+            System.out.println("=== Stage 11 ===");
+            Stage11SignalInspector.Result s11 = Stage11SignalInspector.run(cmpPath);
+            System.out.println("[Stage 11] " + s11);
+
             System.out.println("[AnalyzeSegment] Concluído.");
         }
     }
