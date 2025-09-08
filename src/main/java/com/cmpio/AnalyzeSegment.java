@@ -2,18 +2,21 @@ package com.cmpio;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.nio.file.Path;
-import java.nio.file.Paths;
+import java.nio.file.*;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * Executa a análise de um único segmento.
- * Por padrão, usa o primeiro record do arquivo (o segmento (0,0,0) no seu caso).
- * Se desejar, você pode estender para aceitar seg1/seg2/seg3 por linha de comando
- * e mapear esses índices para o record correto.
+ * Executa análise completa do segmento + Stage 7 e Stage 8,
+ * sem depender de tipos internos do Stage5Reconstructor.
  */
 public final class AnalyzeSegment {
 
     private AnalyzeSegment() {}
+
+    /** Regex para identificar arquivos cycle_XX_tokens.csv */
+    private static final Pattern TOKENS_CYCLE_RE = Pattern.compile("^cycle_(\\d{2})_tokens\\.csv$");
 
     public static void main(String[] args) throws Exception {
         Path cmpPath = Paths.get("D:\\tmp\\cmp_dir\\S_ANALYTIC_ZERODATUM_13.cmp");
@@ -50,17 +53,20 @@ public final class AnalyzeSegment {
 
             int[] hist = new int[maxLen+1];
             for (int L : rec.huffman.lens) if (L>=0 && L<hist.length) hist[L]++;
-            System.out.print("Lengths histogram:"); for (int L=1; L<hist.length; L++) if (hist[L]>0) System.out.print(" " + L + ":" + hist[L]); System.out.println();
+            System.out.print("Lengths histogram:");
+            for (int L=1; L<hist.length; L++) if (hist[L]>0) System.out.print(" " + L + ":" + hist[L]);
+            System.out.println();
 
             long requiredBits = rec.md.totalBits;
             long availableBits = (long) rec.md.payloadBytes * 8L;
             System.out.printf("requiredBits=%d, availableBits=%d, payloadStartByte=%d%n",
                     requiredBits, availableBits, rec.md.payloadStartByte);
 
-            // ===== Stage 4 v2 =====
+            // ===== Stage 4 =====
             System.out.println("=== Stage 4 ===");
             boolean splitOnly251 = true;
             double padMergeThreshold = 0.70;
+            // Não capturamos retorno (run não retorna Result)
             Stage4TokenGrouper.run(file, rec.recStart, order, rec, splitOnly251, padMergeThreshold);
 
             // ===== Stage 4.3 =====
@@ -76,6 +82,61 @@ public final class AnalyzeSegment {
                     ? Paths.get("cmp_stage5_out")
                     : cmpPath.getParent().resolve("cmp_stage5_out");
             Stage5Reconstructor.run(file, rec.recStart, order, rec, outStage5);
+
+            // ===== Stage 7 =====
+            System.out.println("=== Stage 7 ===");
+            Path outStage7 = cmpPath.getParent() == null
+                    ? Paths.get("cmp_stage7_out")
+                    : cmpPath.getParent().resolve("cmp_stage7_out");
+            Files.createDirectories(outStage7);
+
+            List<Path> tokenCsvs = listCycleTokenFiles(outStage5);
+            tokenCsvs.sort(Comparator.comparing(Path::toString));
+            for (Path tokensCsv : tokenCsvs) {
+                int cyc = extractCycleIndex(tokensCsv.getFileName().toString());
+                Path cycDir = outStage7.resolve(String.format("cycle_%02d", cyc));
+                Files.createDirectories(cycDir);
+
+                // escolha do modo
+                Stage7Decoder.RunMode mode = Stage7Decoder.RunMode.REPEAT_LAST;
+                Stage7Decoder.Result r7 = Stage7Decoder.quickRunCsv(tokensCsv, cycDir, mode);
+                System.out.println(r7);
+            }
+
+            // ===== Stage 8 =====
+            System.out.println("=== Stage 8 ===");
+            Path outStage8 = cmpPath.getParent() == null
+                    ? Paths.get("cmp_stage8_out")
+                    : cmpPath.getParent().resolve("cmp_stage8_out");
+            Files.createDirectories(outStage8);
+            Stage8Rebuilder.Result r8 = Stage8Rebuilder.run(outStage7);
+            System.out.println("[Stage 8] " + r8);
+
+            System.out.println("[AnalyzeSegment] Concluído.");
         }
+    }
+
+    /** Lista todos os arquivos cycle_XX_tokens.csv no diretório informado. */
+    private static List<Path> listCycleTokenFiles(Path outStage5) throws Exception {
+        List<Path> list = new ArrayList<>();
+        if (outStage5 == null || !Files.isDirectory(outStage5)) return list;
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(outStage5, "cycle_*_tokens.csv")) {
+            for (Path p : ds) {
+                if (p.getFileName() == null) continue;
+                String name = p.getFileName().toString();
+                if (TOKENS_CYCLE_RE.matcher(name).matches()) list.add(p);
+            }
+        }
+        return list;
+    }
+
+    /** Extrai o índice do ciclo a partir de "cycle_XX_tokens.csv". */
+    private static int extractCycleIndex(String filename) {
+        if (filename == null) return -1;
+        Matcher m = TOKENS_CYCLE_RE.matcher(filename);
+        if (m.matches()) {
+            try { return Integer.parseInt(m.group(1)); } catch (NumberFormatException ignore) {}
+        }
+        return -1;
     }
 }
