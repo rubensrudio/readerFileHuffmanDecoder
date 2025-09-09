@@ -64,23 +64,39 @@ public final class Stage7Decoder {
 
     // ====== Entrada → Tokens ======
 
-    /** Extrai todos os inteiros de uma linha (robusto contra cabeçalhos/colunas mistas). */
+    // Substitua em Stage7Decoder
     private static final Pattern INT_PATTERN = Pattern.compile("[-+]?\\d+");
 
     public static List<Integer> readTokensCsv(Path csv) throws IOException {
         List<Integer> out = new ArrayList<>();
         try (BufferedReader br = Files.newBufferedReader(csv, StandardCharsets.UTF_8)) {
-            String line;
+            String line = br.readLine(); // pula header
             while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
                 Matcher m = INT_PATTERN.matcher(line);
-                // heurística: pegue o primeiro número da linha como o token.
-                if (m.find()) {
-                    int val = Integer.parseInt(m.group());
-                    out.add(val);
-                }
+                Integer last = null;
+                while (m.find()) last = Integer.parseInt(m.group());
+                if (last != null) out.add(last); // 'sym'
             }
         }
         return out;
+    }
+
+    // Helpers
+
+    private static Integer lastIntOnLine(String line) {
+        Matcher m = INT_PATTERN.matcher(line);
+        Integer last = null;
+        while (m.find()) last = Integer.parseInt(m.group());
+        return last;
+    }
+    private static Integer parseIntLenient(String s) {
+        if (s == null || s.isEmpty()) return null;
+        try { return Integer.parseInt(s); } catch (NumberFormatException ignore) {}
+        // tenta extrair inteiro por regex (caso venha algo como "  123  ")
+        Matcher m = INT_PATTERN.matcher(s);
+        return m.find() ? Integer.parseInt(m.group()) : null;
     }
 
     // ====== Decodificação ======

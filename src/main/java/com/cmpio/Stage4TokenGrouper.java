@@ -62,11 +62,70 @@ public final class Stage4TokenGrouper {
         //    mas no modo 251-only cada grupo já é um super-grupo.
         List<List<Integer>> superGroups = splitOnly251 ? groups : promoteToSuperGroups(groups);
 
+        // --- dense-mode detector: 1 grupo e nenhum marcador “antigo”
+        if (superGroups.size() == 1) {
+            List<Integer> all = superGroups.get(0);
+            Set<Integer> uniq = new HashSet<>(all);
+            boolean hasOldMarkers = containsAny(uniq, OP63, FILL, OP195, OP210, SEP_SOFT, SEP_STRONG);
+            if (!hasOldMarkers) {
+                System.out.println("[Stage 4] dense stream detected (no 63/91/195/210/249/251).");
+                printDenseDiag(all);
+            }
+        }
+
+
         // 6) merge de padding contíguo (dentro da lista de super-grupos)
         List<List<Integer>> merged = mergePaddingNeighbors(superGroups, padMergeThreshold);
 
         // 7) sumariza super-grupos
         summarizeSuperGroups(merged);
+    }
+
+    private static Map<Integer, Long> hist(List<Integer> xs) {
+        Map<Integer, Long> h = new HashMap<>();
+        for (int v : xs) h.merge(v, 1L, Long::sum);
+        return h;
+    }
+    private static List<int[]> topNGrams(List<Integer> xs, int n, int topK) {
+        Map<String, Long> freq = new HashMap<>();
+        for (int i = 0; i + n <= xs.size(); i++) {
+            StringBuilder sb = new StringBuilder();
+            for (int k = 0; k < n; k++) { if (k>0) sb.append('_'); sb.append(xs.get(i+k)); }
+            freq.merge(sb.toString(), 1L, Long::sum);
+        }
+        List<Map.Entry<String, Long>> list = new ArrayList<>(freq.entrySet());
+        list.sort((a,b)->Long.compare(b.getValue(), a.getValue()));
+        List<int[]> out = new ArrayList<>();
+        for (int i = 0; i < Math.min(topK, list.size()); i++) {
+            String[] parts = list.get(i).getKey().split("_");
+            int[] ngram = new int[parts.length];
+            for (int j=0;j<parts.length;j++) ngram[j] = Integer.parseInt(parts[j]);
+            out.add(ngram);
+        }
+        return out;
+    }
+    private static boolean containsAny(Set<Integer> set, int... wanted) {
+        for (int w : wanted) if (set.contains(w)) return true;
+        return false;
+    }
+    private static void printDenseDiag(List<Integer> tokens) {
+        Map<Integer, Long> h = hist(tokens);
+        List<Map.Entry<Integer, Long>> top = new ArrayList<>(h.entrySet());
+        top.sort((a,b)->Long.compare(b.getValue(), a.getValue()));
+        System.out.print("[Stage 4] dense-mode alphabet top: ");
+        for (int i=0; i<Math.min(12, top.size()); i++) {
+            Map.Entry<Integer, Long> e = top.get(i);
+            System.out.print(e.getKey() + "(" + e.getValue() + ") ");
+        }
+        System.out.println();
+        List<int[]> bi = topNGrams(tokens, 2, 8);
+        List<int[]> tri= topNGrams(tokens, 3, 8);
+        System.out.print("[Stage 4] top bi-grams: ");
+        for (int[] g : bi) System.out.print(Arrays.toString(g) + " ");
+        System.out.println();
+        System.out.print("[Stage 4] top tri-grams: ");
+        for (int[] g : tri) System.out.print(Arrays.toString(g) + " ");
+        System.out.println();
     }
 
     // ---------------------------------------------------------------------

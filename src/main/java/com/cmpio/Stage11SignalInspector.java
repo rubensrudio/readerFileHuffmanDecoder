@@ -8,16 +8,15 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * Stage 11 - Inspeção de sinal (autocorrelação/DFT/histogramas) para apoiar a decodificação final.
+ * Stage 11 - Inspeção de sinal (autocorrelação/DFT/histogramas).
  *
- * Entradas esperadas (geradas pelos Stages 9 e 10):
- *  - stage9_series.csv       (uma série por ciclo; cabeçalho: cycle_id,value_idx,value)
- *  - stage10_mapped.csv      (opcional; mapeamento discreto/normalizado por linha)
+ * Entradas esperadas:
+ *  - stage9_series.csv (preferido) ou stage9_concat.csv no diretório do Stage 9.
  *
- * Saídas (em cmp_stage11_out):
+ * Saídas:
  *  - stage11_summary.txt
- *  - stage11_autocorr.csv    (colunas: lag, autocorr)
- *  - stage11_fft.csv         (colunas: k, freq_norm, magnitude)
+ *  - stage11_autocorr.csv
+ *  - stage11_fft.csv
  */
 public final class Stage11SignalInspector {
 
@@ -28,7 +27,7 @@ public final class Stage11SignalInspector {
         public final Path fftCsv;
 
         public final int seriesLen;
-        public final List<Integer> topLags;     // lags de maior autocorrelação (excluindo 0)
+        public final List<Integer> topLags;     // lags de maior autocorrelação (exclui 0)
         public final List<Integer> topFreqBins; // bins de maior magnitude no DFT
 
         Result(Path outDir, Path summaryTxt, Path autocorrCsv, Path fftCsv,
@@ -52,43 +51,54 @@ public final class Stage11SignalInspector {
 
     private Stage11SignalInspector() {}
 
-    /** Executa o Stage 11. */
-    public static Result run(Path baseDir) throws IOException {
-        Path outDir = (baseDir.getParent() == null)
-                ? Paths.get("cmp_stage11_out")
-                : baseDir.getParent().resolve("cmp_stage11_out");
+    /** NOVA assinatura preferida: você informa onde está o Stage 9 e onde quer as saídas. */
+    public static Result run(Path stage9Dir, Path outDir) throws IOException {
+        if (stage9Dir == null) throw new IOException("Stage 11: stage9Dir == null");
+        if (!Files.isDirectory(stage9Dir)) {
+            throw new IOException("Stage 11: diretório do Stage 9 não existe: " + stage9Dir);
+        }
+        if (outDir == null) {
+            // default ao lado do stage9Dir
+            outDir = stage9Dir.getParent() == null
+                    ? Paths.get("cmp_stage11_out")
+                    : stage9Dir.getParent().resolve("cmp_stage11_out");
+        }
         Files.createDirectories(outDir);
 
-        // Preferimos a série consolidada do Stage 9:
-        Path seriesCsv = outDir.getParent().resolve("cmp_stage9_out").resolve("stage9_series.csv");
+        // Escolhe a série
+        Path seriesCsv = stage9Dir.resolve("stage9_series.csv");
         if (!Files.exists(seriesCsv)) {
-            // fallback: concatenado
-            seriesCsv = outDir.getParent().resolve("cmp_stage9_out").resolve("stage9_concat.csv");
+            seriesCsv = stage9Dir.resolve("stage9_concat.csv");
         }
         if (!Files.exists(seriesCsv)) {
-            throw new IOException("Stage 11: não encontrei stage9_series.csv nem stage9_concat.csv.");
+            throw new IOException("Stage 11: não encontrei stage9_series.csv nem stage9_concat.csv em " + stage9Dir);
         }
 
         double[] series = loadSeries(seriesCsv);
         int N = series.length;
+        if (N == 0) {
+            // Ainda assim escrevemos um summary mínimo para não quebrar o pipeline
+            Path summary = outDir.resolve("stage11_summary.txt");
+            Files.writeString(summary, "=== Stage 11 Summary ===\nSeries length: 0\n");
+            Path acCsv = outDir.resolve("stage11_autocorr.csv");
+            Files.writeString(acCsv, "lag,autocorr\n");
+            Path fftCsv = outDir.resolve("stage11_fft.csv");
+            Files.writeString(fftCsv, "k,freq_norm,magnitude\n");
+            System.out.println("[Stage 11] Série vazia. Artefatos mínimos gerados em " + outDir);
+            return new Result(outDir, summary, acCsv, fftCsv, 0, Collections.emptyList(), Collections.emptyList());
+        }
 
-        // Histogramas simples (valor -> contagem)
         Map<Double, Integer> hist = histogram(series, 64);
-
-        // Autocorrelação (até lag máx razoável: N/2)
         int maxLag = Math.max(4, Math.min(256, N / 2));
         double[] ac = autocorr(series, maxLag);
 
-        // DFT simples (magnitude) – bins 0..N-1, mas reportamos só 0..N/2
         double[] mag = dftMagnitude(series);
         int half = mag.length / 2;
 
-        // Escolher top lags e top bins
-        List<Integer> topLags = topKIndices(ac, 5, 1); // ignora lag 0
+        List<Integer> topLags = topKIndices(ac, 5, 1);
         List<Integer> topBins = topKIndices(Arrays.copyOfRange(mag, 1, half), 5, 0)
                 .stream().map(i -> i + 1).collect(Collectors.toList());
 
-        // Gravar arquivos
         Path summary = outDir.resolve("stage11_summary.txt");
         Path acCsv   = outDir.resolve("stage11_autocorr.csv");
         Path fftCsv  = outDir.resolve("stage11_fft.csv");
@@ -123,8 +133,26 @@ public final class Stage11SignalInspector {
             }
         }
 
+        Path peaksCsv = outDir.resolve("stage11_peaks.csv");
+        try (BufferedWriter w = Files.newBufferedWriter(peaksCsv, StandardCharsets.UTF_8)) {
+            w.write("type,index,value\n");
+            for (int lag : topLags) w.write("autocorr," + lag + "," + String.format(Locale.ROOT,"%.9f", (lag < ac.length ? ac[lag] : Double.NaN)) + "\n");
+            for (int k : topBins)  w.write("fft," + k + "," + String.format(Locale.ROOT,"%.9f", (k < mag.length ? mag[k] : Double.NaN)) + "\n");
+        }
+
         System.out.println("[Stage 11] " + outDir);
         return new Result(outDir, summary, acCsv, fftCsv, N, topLags, topBins);
+    }
+
+    /** Assinatura compatível: se baseDir == cmp_stage9_out usa direto; senão tenta baseDir/cmp_stage9_out. */
+    public static Result run(Path baseDir) throws IOException {
+        if (baseDir == null) throw new IOException("Stage 11: baseDir == null");
+        final String name = baseDir.getFileName() != null ? baseDir.getFileName().toString() : "";
+        Path stage9Dir = name.equalsIgnoreCase("cmp_stage9_out")
+                ? baseDir
+                : baseDir.resolve("cmp_stage9_out");
+        Path outDir = baseDir.resolve("cmp_stage11_out");
+        return run(stage9Dir, outDir);
     }
 
     // ---------- Utilidades ----------
@@ -134,15 +162,10 @@ public final class Stage11SignalInspector {
         List<String> lines = Files.readAllLines(csv, StandardCharsets.UTF_8);
         if (lines.isEmpty()) return new double[0];
 
-        // Detecta header e índice da coluna "value"
         String header = lines.get(0);
-        int valueIdx = findFirstInt(header.split(","), "value");
-        int start = 0;
-        if (header.toLowerCase(Locale.ROOT).contains("value")) {
-            start = 1; // pula header
-        } else {
-            valueIdx = -1; // fallback: última coluna
-        }
+        int valueIdx = findHeaderIndex(header.split(","), "value");
+        int start = header.toLowerCase(Locale.ROOT).contains("value") ? 1 : 0;
+        if (start == 0) valueIdx = -1;
 
         List<Double> vals = new ArrayList<>();
         for (int i = start; i < lines.size(); i++) {
@@ -150,15 +173,12 @@ public final class Stage11SignalInspector {
             if (ln.isEmpty()) continue;
             String[] cols = ln.split(",");
             String tok = (valueIdx >= 0 && valueIdx < cols.length) ? cols[valueIdx] : cols[cols.length - 1];
+            if (!tok.isEmpty() && tok.charAt(0) == '\uFEFF') tok = tok.substring(1);
+            tok = tok.trim();
             try {
                 vals.add(Double.parseDouble(tok));
             } catch (NumberFormatException nfe) {
-                // tenta int
-                try {
-                    vals.add((double) Integer.parseInt(tok));
-                } catch (NumberFormatException nfe2) {
-                    // ignora linhas inválidas
-                }
+                try { vals.add((double) Integer.parseInt(tok)); } catch (NumberFormatException ignore) {}
             }
         }
         double[] arr = new double[vals.size()];
@@ -166,8 +186,7 @@ public final class Stage11SignalInspector {
         return arr;
     }
 
-    /** Procura pela coluna com nome exato (case-insensitive) e retorna seu índice, ou -1. */
-    private static int findFirstInt(String[] headers, String wantedName) {
+    private static int findHeaderIndex(String[] headers, String wantedName) {
         String w = wantedName.toLowerCase(Locale.ROOT);
         for (int i = 0; i < headers.length; i++) {
             String h = headers[i].trim().toLowerCase(Locale.ROOT);
@@ -176,16 +195,12 @@ public final class Stage11SignalInspector {
         return -1;
     }
 
-    /** Histograma aproximado com 'bins' caixas, retorna centro da caixa -> contagem. */
     private static Map<Double, Integer> histogram(double[] x, int bins) {
         Map<Double, Integer> out = new LinkedHashMap<>();
         if (x.length == 0) return out;
         double min = Arrays.stream(x).min().orElse(0);
         double max = Arrays.stream(x).max().orElse(0);
-        if (max <= min) {
-            out.put(min, x.length);
-            return out;
-        }
+        if (max <= min) { out.put(min, x.length); return out; }
         double step = (max - min) / bins;
         for (double v : x) {
             int b = (int) Math.floor((v - min) / step);
@@ -196,7 +211,6 @@ public final class Stage11SignalInspector {
         return out;
     }
 
-    /** Autocorrelação normalizada por variância, lags 0..maxLag. */
     private static double[] autocorr(double[] x, int maxLag) {
         int N = x.length;
         double mean = Arrays.stream(x).average().orElse(0.0);
@@ -214,14 +228,12 @@ public final class Stage11SignalInspector {
         return out;
     }
 
-    /** DFT (magnitude) O(N^2). Para N=234 é aceitável. */
     private static double[] dftMagnitude(double[] x) {
         int N = x.length;
         double[] mag = new double[N];
         double twoPiOverN = 2 * Math.PI / N;
         for (int k = 0; k < N; k++) {
-            double re = 0.0;
-            double im = 0.0;
+            double re = 0.0, im = 0.0;
             for (int n = 0; n < N; n++) {
                 double ang = twoPiOverN * k * n;
                 re += x[n] * Math.cos(ang);
@@ -232,12 +244,10 @@ public final class Stage11SignalInspector {
         return mag;
     }
 
-    /** Retorna índices dos K maiores valores (desc), com offset aplicado (p.ex., pular lag 0). */
     private static List<Integer> topKIndices(double[] arr, int K, int skipFirst) {
         List<Integer> idx = new ArrayList<>();
         for (int i = skipFirst; i < arr.length; i++) idx.add(i);
         idx.sort((a, b) -> Double.compare(arr[b], arr[a]));
-        if (idx.size() > K) return idx.subList(0, K);
-        return idx;
+        return (idx.size() > K) ? idx.subList(0, K) : idx;
     }
 }

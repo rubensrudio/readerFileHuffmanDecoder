@@ -96,6 +96,57 @@ public final class Stage4SchemaExtractor {
         }
     }
 
+    private static boolean denseHeuristicFromInfos(List<SGInfo> infos) {
+        if (infos == null || infos.size() != 1) return false;
+        SGInfo s = infos.get(0);
+        return s.pos63.isEmpty() && s.pos195.isEmpty() && s.pos210.isEmpty() && s.count249 == 0;
+    }
+
+    private static Map<Integer, Long> histInts(List<Integer> xs) {
+        Map<Integer, Long> h = new HashMap<>();
+        for (int v : xs) h.merge(v, 1L, Long::sum);
+        return h;
+    }
+    private static List<int[]> topNGrams(List<Integer> xs, int n, int topK) {
+        Map<String, Long> freq = new HashMap<>();
+        for (int i = 0; i + n <= xs.size(); i++) {
+            StringBuilder sb = new StringBuilder();
+            for (int k = 0; k < n; k++) { if (k>0) sb.append('_'); sb.append(xs.get(i+k)); }
+            freq.merge(sb.toString(), 1L, Long::sum);
+        }
+        List<Map.Entry<String, Long>> list = new ArrayList<>(freq.entrySet());
+        list.sort((a,b)->Long.compare(b.getValue(), a.getValue()));
+        List<int[]> out = new ArrayList<>();
+        for (int i = 0; i < Math.min(topK, list.size()); i++) {
+            String[] parts = list.get(i).getKey().split("_");
+            int[] ngram = new int[parts.length];
+            for (int j=0;j<parts.length;j++) ngram[j] = Integer.parseInt(parts[j]);
+            out.add(ngram);
+        }
+        return out;
+    }
+    private static boolean denseMode(List<List<Integer>> sgs) {
+        if (sgs.size() != 1) return false;
+        Set<Integer> u = new HashSet<>(sgs.get(0));
+        int[] marks = {63,91,195,210,249,251};
+        for (int m : marks) if (u.contains(m)) return false;
+        return true;
+    }
+    private static String listOfIntArraysToJson(List<int[]> grams) {
+        StringBuilder sb = new StringBuilder("[");
+        for (int i=0;i<grams.size();i++) {
+            if (i>0) sb.append(",");
+            sb.append("[");
+            for (int j=0;j<grams.get(i).length;j++) {
+                if (j>0) sb.append(",");
+                sb.append(grams.get(i)[j]);
+            }
+            sb.append("]");
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
     // ---------------------------------------------------------------------
     // Split por 251 (EOB)
 
@@ -305,6 +356,29 @@ public final class Stage4SchemaExtractor {
         sb.append("\"N\": ").append(rec.huffman.N).append(", ");
         sb.append("\"payloadStartByte\": ").append(rec.md.payloadStartByte).append(", ");
         sb.append("\"totalBits\": ").append(rec.md.totalBits).append("},\n");
+
+        // dense summary (se aplicável) — baseado SOMENTE nas features dos SGs
+        boolean dense = denseHeuristicFromInfos(infos);
+
+        if (dense) {
+            Map<Integer, Long> h = infos.get(0).hist;
+            List<Map.Entry<Integer, Long>> top = new ArrayList<>(h.entrySet());
+            top.sort((a,b)->Long.compare(b.getValue(), a.getValue()));
+            StringBuilder topSym = new StringBuilder("[");
+            for (int i=0; i<Math.min(12, top.size()); i++) {
+                if (i>0) topSym.append(",");
+                topSym.append("{\"sym\":").append(top.get(i).getKey())
+                        .append(",\"count\":").append(top.get(i).getValue()).append("}");
+            }
+            topSym.append("]");
+
+            sb.append("  \"denseSummary\": {");
+            sb.append("\"note\": \"no legacy markers (63/91/195/210/249/251) — dense stream\", ");
+            sb.append("\"topSymbols\": ").append(topSym).append(", ");
+            sb.append("\"countSymbols\": ").append(h.values().stream().mapToLong(Long::longValue).sum());
+            sb.append("},\n");
+        }
+
         sb.append("  \"superGroups\": [\n");
         for (int i = 0; i < infos.size(); i++) {
             SGInfo s = infos.get(i);

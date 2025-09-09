@@ -6,19 +6,6 @@ import java.nio.file.*;
 import java.util.*;
 import java.util.stream.Collectors;
 
-/**
- * Stage 5 – Reconstructor (v1.1)
- *
- * - Monta bitstream multi-record
- * - Auto-probe (LSB/MSB, invert, shift)
- * - Decodifica tokens e separa super-grupos por 251 (EOB forte)
- * - **NOVO**: aplica o mesmo merge de padding do Stage 4 v2 / 4.3
- * - Classifica SGs em P/A/B/C/D/E/T (heurístico)
- * - Detecta ciclos A→B→C→D→E
- * - Exporta:
- *     * cycle_k_tokens.csv  : tokens brutos por SG do ciclo
- *     * cycle_k_rle.csv     : RLE simples (runs) para ver o padrão de 91
- */
 public final class Stage5Reconstructor {
 
     private static final int SEP_STRONG = 251; // EOB forte
@@ -31,12 +18,36 @@ public final class Stage5Reconstructor {
 
     private Stage5Reconstructor() {}
 
-    public static void run(ByteBuffer file, int recStart, ByteOrder order,
-                           SegmentRecord rec, Path outDir) {
+    // === NOVO: Result para consumo no pipeline ===
+    public static final class Result {
+        public final boolean lsb, invert;
+        public final int shift;
+        public final int superGroupsBefore, superGroupsAfter;
+        public final List<String> types;     // tipo por SG, ex.: ["M"]
+        public final List<int[]> cycles;     // ciclos A..E (start,len)
+        public final Path outDir;            // dir de saída (cmp_stage5_out)
+
+        Result(boolean lsb, boolean invert, int shift,
+               int before, int after, List<String> types,
+               List<int[]> cycles, Path outDir) {
+            this.lsb = lsb; this.invert = invert; this.shift = shift;
+            this.superGroupsBefore = before; this.superGroupsAfter = after;
+            this.types = types; this.cycles = cycles; this.outDir = outDir;
+        }
+
+        @Override public String toString() {
+            return String.format(Locale.ROOT,
+                    "Stage5.Result{bits=%s, invert=%s, shift=%d, SGs(before=%d,after=%d), cycles=%d, out=%s}",
+                    lsb ? "LSB" : "MSB", invert, shift,
+                    superGroupsBefore, superGroupsAfter, cycles.size(), outDir);
+        }
+    }
+
+    public static Result run(ByteBuffer file, int recStart, ByteOrder order,
+                             SegmentRecord rec, Path outDir, double padMergeThreshold) {
         try {
             if (outDir != null) Files.createDirectories(outDir);
 
-            // 1) Montar bitstream multi-record
             long requiredBits = rec.md.totalBits;
             PayloadAssembler.Assembled assembled =
                     PayloadAssembler.assemble(file, recStart, order, rec, requiredBits);
@@ -44,27 +55,26 @@ public final class Stage5Reconstructor {
             byte[] stream = assembled.bytes;
             long limitBits = Math.min(requiredBits, (long) stream.length * 8L);
 
-            // 2) Auto-probe
             Probe pick = autoProbe(rec.huffman.symbols, rec.huffman.lens, stream, limitBits);
             System.out.printf(Locale.ROOT,
                     "Stage 5: using bits-%s, invert=%s, shift=%d%n",
                     pick.lsb ? "LSB" : "MSB", pick.invert, pick.shift);
 
-            // 3) Decoder
             HuffmanStreamDecoder dec = HuffmanStreamDecoder.fromCanonical(
                     rec.huffman.symbols, rec.huffman.lens, stream, requiredBits,
                     pick.lsb, pick.invert, pick.shift);
 
-            // 4) SGs por 251
             List<List<Integer>> sgs = splitBy251(dec);
-            System.out.printf(Locale.ROOT, "Stage 5: %d super-grupos (antes do merge)%n", sgs.size());
+            int beforeCount = sgs.size();
+            System.out.printf(Locale.ROOT, "Stage 5: %d super-grupos (antes do merge)%n", beforeCount);
 
-            // 5) **Merge de padding** (mesma regra do Stage 4 v2/4.3)
-            double padMergeThreshold = 0.70; // >=70% de 91 => padding
+            if (beforeCount == 1) {
+                System.out.println("Stage 5: nenhum 251 detectado — fluxo exportado como um único super-grupo.");
+            }
+
             sgs = mergePaddingNeighbors(sgs, padMergeThreshold);
             System.out.printf(Locale.ROOT, "Stage 5: %d super-grupos (após merge)%n", sgs.size());
 
-            // 6) Classificar SGs
             List<SGInfo> infos = new ArrayList<>();
             for (int i = 0; i < sgs.size(); i++) {
                 SGInfo info = analyzeSG(sgs.get(i));
@@ -73,11 +83,9 @@ public final class Stage5Reconstructor {
                 infos.add(info);
             }
 
-            // 7) Ciclos A→B→C→D→E
             List<int[]> cycles = detectCycles(infos);
             if (cycles.isEmpty()) {
-                System.out.println("Stage 5: nenhum ciclo A→B→C→D→E detectado após o merge. " +
-                        "Exportando um bloco único como fallback.");
+                System.out.println("Stage 5: nenhum ciclo A→B→C→D→E detectado após o merge. Exportando fallback único.");
             } else {
                 System.out.print("Stage 5: ciclos A→B→C→D→E em: ");
                 for (int i = 0; i < cycles.size(); i++) {
@@ -88,12 +96,10 @@ public final class Stage5Reconstructor {
                 System.out.println();
             }
 
-            // 8) Export
-            Path out = (outDir == null)
-                    ? Paths.get("cmp_stage5_out")
-                    : outDir;
+            Path out = (outDir == null) ? Paths.get("cmp_stage5_out") : outDir;
             Files.createDirectories(out);
 
+            // Export CSVs
             if (cycles.isEmpty()) {
                 exportCycle(out, 0, infos, sgs, Math.max(0, findFirstABegin(infos)), Math.min(5, sgs.size()));
             } else {
@@ -101,16 +107,30 @@ public final class Stage5Reconstructor {
                 for (int[] c : cycles) exportCycle(out, k++, infos, sgs, c[0], c[1]);
             }
 
+            // (Opcional) hist por SG
+            exportHistCsv(out, infos);
+
+            // **NOVO**: meta JSON
+            Path meta = out.resolve("stage5_meta.json");
+            String metaJson = String.format(Locale.ROOT,
+                    "{ \"bits\":\"%s\", \"invert\":%s, \"shift\":%d, \"superGroupsBefore\":%d, \"superGroupsAfter\":%d, \"padMergeThreshold\":%.2f }%n",
+                    pick.lsb ? "LSB" : "MSB", pick.invert, pick.shift, beforeCount, sgs.size(), padMergeThreshold);
+            Files.writeString(meta, metaJson, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+
             System.out.println("Stage 5: export concluído em " + out.toAbsolutePath());
+
+            // monta e retorna Result
+            List<String> types = infos.stream().map(s -> s.type).collect(Collectors.toList());
+            return new Result(pick.lsb, pick.invert, pick.shift, beforeCount, sgs.size(), types, cycles, out);
 
         } catch (Exception e) {
             System.err.println("Stage5Reconstructor: erro: " + e.getMessage());
             e.printStackTrace(System.err);
+            return new Result(false, false, 0, 0, 0, List.of(), List.of(), outDir);
         }
     }
 
     // ===== Split / Merge =====
-
     private static List<List<Integer>> splitBy251(HuffmanStreamDecoder dec) {
         List<List<Integer>> out = new ArrayList<>();
         List<Integer> cur = new ArrayList<>();
@@ -145,7 +165,6 @@ public final class Stage5Reconstructor {
     }
 
     // ===== SG analysis / classify =====
-
     private static final class SGInfo {
         int index;
         int size;
@@ -231,13 +250,10 @@ public final class Stage5Reconstructor {
         return cycles;
     }
 
-    // fallback: localizar primeiro 'A' para exportar algo coerente
     private static int findFirstABegin(List<SGInfo> infos) {
         for (int i = 0; i < infos.size(); i++) if ("A".equals(infos.get(i).type)) return i;
         return 0;
     }
-
-    // ===== Export =====
 
     private static void exportCycle(Path outDir, int cycleIdx,
                                     List<SGInfo> infos, List<List<Integer>> sgs,
@@ -282,6 +298,22 @@ public final class Stage5Reconstructor {
         System.out.println("  cycle_" + cycleIdx + ": RLE -> " + rleCsv.toAbsolutePath());
     }
 
+    private static void exportHistCsv(Path outDir, List<SGInfo> infos) throws Exception {
+        Path histCsv = outDir.resolve("stage5_hist.csv");
+        List<String> lines = new ArrayList<>();
+        lines.add("sg_index,sym,count");
+        for (SGInfo s : infos) {
+            // ordena top-first só para leitura agradável (opcional)
+            List<Map.Entry<Integer, Long>> sorted = new ArrayList<>(s.hist.entrySet());
+            sorted.sort((a,b)-> Long.compare(b.getValue(), a.getValue()));
+            for (Map.Entry<Integer, Long> e : sorted) {
+                lines.add(s.index + "," + e.getKey() + "," + e.getValue());
+            }
+        }
+        Files.write(histCsv, lines, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        System.out.println("  hist -> " + histCsv.toAbsolutePath());
+    }
+
     private static List<int[]> runsOf(List<Integer> g) {
         List<int[]> out = new ArrayList<>();
         if (g.isEmpty()) return out;
@@ -296,7 +328,6 @@ public final class Stage5Reconstructor {
     }
 
     // ===== Auto-probe =====
-
     private static Probe autoProbe(int[] symbols, int[] lens, byte[] stream, long limitBits) {
         boolean[] orders = { true, false }; // lsb?
         boolean[] invs   = { false, true };

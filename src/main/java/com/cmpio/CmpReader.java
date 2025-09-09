@@ -8,6 +8,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Leitor robusto do formato CMP.
@@ -27,6 +29,16 @@ public final class CmpReader implements AutoCloseable {
     // ==== Constantes de layout a partir da especificação ====
     private static final int FILE_HEADER_SIZE = 1024;
     public  static final int SEGMENT_RECORD_SIZE = 8192; // cada segmento ocupa 8192 bytes
+
+    // ----- Configuração de sondagem (pode virar parâmetros/flags) -----
+    private static final int DEFAULT_MAX_S1 = Integer.getInteger("cmp.s1.max", 64);
+    private static final int DEFAULT_MAX_S2 = Integer.getInteger("cmp.s2.max", 64);
+    private static final int DEFAULT_MAX_S3 = Integer.getInteger("cmp.s3.max", 64);
+
+    // Encerrar um eixo quando X fatias consecutivas vierem 100% vazias
+    private static final int EMPTY_STRIPES_TO_STOP_S3 = Integer.getInteger("cmp.stop.s3.after.empty", 4);
+    private static final int EMPTY_STRIPES_TO_STOP_S2 = Integer.getInteger("cmp.stop.s2.after.empty", 3);
+    private static final int EMPTY_STRIPES_TO_STOP_S1 = Integer.getInteger("cmp.stop.s1.after.empty", 2);
 
     // Offsets dentro do File Header (ints/longs encadeados)
     private static final int FH_DIRTY    = 0;                // int
@@ -389,4 +401,74 @@ public final class CmpReader implements AutoCloseable {
     public void closeQuietly() {
         try { close(); } catch (Exception ignore) {}
     }
+
+    /** Leitura “segura”: devolve null se inválido/fora de range/erro. */
+    private SegmentRecord safeReadSegmentRecord(int s1, int s2, int s3) {
+        try {
+            SegmentRecord rec = readSegmentRecord(s1, s2, s3);
+            if (rec == null || rec.md == null) return null;
+            if (rec.md.totalBits <= 0 || rec.md.payloadBytes <= 0) return null;
+            // Também valida posição de payload se quiser:
+            if (rec.md.payloadStartByte <= 0) return null;
+            return rec;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * Enumera segmentos não-vazios por sondagem, com limites e paradas inteligentes.
+     * Ajuste os limites via -Dcmp.s{1,2,3}.max=...
+     */
+    public List<int[]> listNonEmptySegments() {
+        List<int[]> out = new ArrayList<>();
+        final int S1_MAX = DEFAULT_MAX_S1;
+        final int S2_MAX = DEFAULT_MAX_S2;
+        final int S3_MAX = DEFAULT_MAX_S3;
+
+        int emptyS1Stripes = 0;
+
+        for (int s1 = 0; s1 < S1_MAX; s1++) {
+            int foundInS1 = 0;
+            int emptyS2Stripes = 0;
+
+            for (int s2 = 0; s2 < S2_MAX; s2++) {
+                int foundInS2 = 0;
+                int emptyS3Stripes = 0;
+
+                for (int s3 = 0; s3 < S3_MAX; s3++) {
+                    SegmentRecord rec = safeReadSegmentRecord(s1, s2, s3);
+                    if (rec != null) {
+                        out.add(new int[]{s1, s2, s3});
+                        foundInS1++;
+                        foundInS2++;
+                        emptyS3Stripes = 0; // reset — achamos algo nesta “faixa” s3
+                    } else {
+                        emptyS3Stripes++;
+                        // muitas posições s3 consecutivas vazias → provável fim do eixo s3 para este (s1,s2)
+                        if (emptyS3Stripes >= EMPTY_STRIPES_TO_STOP_S3) break;
+                    }
+                }
+
+                if (foundInS2 == 0) {
+                    emptyS2Stripes++;
+                    // nenhuma posição s3 com dados para este s2, repetido várias vezes → encerra s2 cedo
+                    if (emptyS2Stripes >= EMPTY_STRIPES_TO_STOP_S2) break;
+                } else {
+                    emptyS2Stripes = 0; // reset — houve dados em algum s3 deste s2
+                }
+            }
+
+            if (foundInS1 == 0) {
+                emptyS1Stripes++;
+                // nenhum s2/s3 com dados para este s1, repetido algumas vezes → encerra s1 cedo
+                if (emptyS1Stripes >= EMPTY_STRIPES_TO_STOP_S1) break;
+            } else {
+                emptyS1Stripes = 0;
+            }
+        }
+
+        return out;
+    }
+
 }
